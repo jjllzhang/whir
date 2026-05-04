@@ -367,14 +367,14 @@ These are the only decisions that can materially change the implementation shape
 | Done | P5 | Constraints and ternary sumcheck | `cargo test --lib constraint` |
 | Done | P6 | Repeated ternary folding | `cargo test --lib folding` |
 | Done | P7 | Unique-decoding selector | `cargo test --lib soundness` |
-| Todo | P8 | Prover and verifier | `cargo test --lib whir_gr_roundtrip` |
+| Done | P8 | Prover and verifier | `cargo test --lib prover` |
 | Todo | P9 | Benchmark parity surface | `cargo run --release --bin whir_gr_benchmark -- --help` |
 | Todo | P10 | Release candidate sweep | fmt, tests, clippy, parity row |
 
 ## 10. Immediate Next Step
 
-Start P8 by wiring the WHIR_GR prover/verifier round trip on top of the completed algebra,
-transcript, multiquadratic, constraint, folding, and selector layers.
+Start P9 by adding a WHIR_GR benchmark/parity CLI surface that can emit comparable rows for the
+Rust-native unique-decoding prototype.
 
 ## 11. Phase Review Log
 
@@ -582,3 +582,33 @@ Confirmed boundary:
   `r=162` rows for `m=4..10`. It uses `u128` for algebraic-bound accounting, which covers the
   current prototype and benchmark preset range; a future very-large-parameter selector may need a
   bigint-backed bound to fully mirror the C++ NTL `ZZ` implementation.
+
+### P8. Prover and Verifier
+
+Status: complete in this branch; review gates passed.
+
+Implemented:
+
+- `src/protocols/whir_gr/prover.rs`: `WhirGrProver`, commit state, public-parameter validation,
+  multiquadratic and multilinear commit paths, oracle encoding, opening transcript preamble,
+  per-layer honest sumcheck proving, next-oracle Merkle commitments, virtual-fold query openings,
+  constraint/sigma updates, and final constant openings.
+- `src/protocols/whir_gr/verifier.rs`: `WhirGrVerifier`, proof-shape checks, transcript replay,
+  sumcheck identity checks, Merkle query verification, virtual-fold payload evaluation, constraint
+  updates, final constant consistency, and final Merkle payload checks.
+- `src/protocols/whir_gr/mod.rs`: public prover and verifier module exports.
+
+Review evidence:
+
+- `cargo fmt --check`: passed.
+- `cargo clippy --lib --all-features --locked -- -D warnings`: passed.
+- `cargo test --lib prover`: passed, honest roundtrip and tamper rejection.
+- `cargo test --lib`: passed, 179 passed and 25 ignored.
+- `git diff --check`: passed.
+- C++ reference smoke: `$HOME/STIR&WHIRoverGR/build/test_whir_roundtrip` passed all tests.
+
+Confirmed boundary:
+
+- P8 is a Rust-native transcript/proof implementation. It follows the C++ unique-decoding protocol
+  flow and test shapes, but it intentionally does not attempt byte-for-byte C++ proof or transcript
+  compatibility.
