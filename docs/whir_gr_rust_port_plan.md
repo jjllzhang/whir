@@ -364,7 +364,7 @@ These are the only decisions that can materially change the implementation shape
 | Done | P2 | Teichmuller and domains | `cargo test --lib galois_ring` |
 | Done | P3 | Serialization, transcript, Merkle | `cargo test --lib whir_gr` |
 | Done | P4 | Multiquadratic layer | `cargo test --lib multiquadratic` |
-| Todo | P5 | Constraints and ternary sumcheck | `cargo test --lib whir_gr_constraint` |
+| Done | P5 | Constraints and ternary sumcheck | `cargo test --lib constraint` |
 | Todo | P6 | Repeated ternary folding | `cargo test --lib whir_gr_folding` |
 | Todo | P7 | Unique-decoding selector | `cargo test --lib whir_gr_soundness` |
 | Todo | P8 | Prover and verifier | `cargo test --lib whir_gr_roundtrip` |
@@ -373,8 +373,8 @@ These are the only decisions that can materially change the implementation shape
 
 ## 10. Immediate Next Step
 
-Start P5 by porting the WHIR_GR constraint and ternary sumcheck helper layer. Keep prover/verifier
-code out of scope until P5 and P6 establish deterministic constraint and folding helpers.
+Start P6 by porting repeated ternary folding and virtual fold query helpers. Keep prover/verifier
+code out of scope until P6 establishes deterministic folding payload semantics.
 
 ## 11. Phase Review Log
 
@@ -500,3 +500,30 @@ Confirmed boundary:
 
 - P4 uses Rust-native ring/domain choices from P1/P2. It checks structural behavior and algebraic
   identities rather than byte-for-byte C++ coefficient fixtures.
+
+### P5. Constraints and Ternary Sumcheck
+
+Status: complete in this branch; review gates passed.
+
+Implemented:
+
+- `src/protocols/whir_gr/constraint.rs`: ternary grid construction, unit-difference validation,
+  Lagrange basis evaluation, equality-kernel helpers, `WhirConstraint` term management, constraint
+  evaluation, prefix restriction, honest one-round sumcheck polynomial construction, interpolation,
+  polynomial evaluation, degree checks, grid-sum identity checks, and next-sigma derivation.
+- `src/protocols/whir_gr/mod.rs`: public constraint module export.
+
+Review evidence:
+
+- `cargo fmt --check`: passed.
+- `cargo clippy --lib --all-features --locked -- -D warnings`: passed.
+- `cargo test --lib constraint`: passed, 7 tests and 1 unrelated ignored WHIR test.
+- `cargo test --lib`: passed, 161 passed and 25 ignored.
+- `git diff --check`: passed.
+- C++ reference smoke: `$HOME/STIR&WHIRoverGR/build/test_whir_constraint` passed all tests.
+
+Confirmed boundary:
+
+- P5 implements the correctness-first, enumerative honest-sumcheck path. It does not yet port the
+  C++ factor-table or cache-oriented fast path; those optimizations should wait until prover,
+  verifier, and benchmark parity are in place.
