@@ -360,7 +360,7 @@ These are the only decisions that can materially change the implementation shape
 | Status | Phase | Deliverable | Acceptance |
 | --- | --- | --- | --- |
 | Done | P0 | Branch and plan document | `feature/whir-gr`, this file exists |
-| Todo | P1 | Galois ring core | `cargo test --lib galois_ring` |
+| Done | P1 | Galois ring core | `cargo test --lib galois_ring` |
 | Todo | P2 | Teichmuller and domains | `cargo test --lib teichmuller domain` |
 | Todo | P3 | Serialization, transcript, Merkle | `cargo test --lib whir_gr_serialization whir_gr_merkle` |
 | Todo | P4 | Multiquadratic layer | `cargo test --lib whir_gr_multiquadratic` |
@@ -373,6 +373,39 @@ These are the only decisions that can materially change the implementation shape
 
 ## 10. Immediate Next Step
 
-Start P1 by porting the ring context and element arithmetic. Do not touch prover or verifier code
-until P1 and P2 have deterministic C++ parity tests, because every later protocol check depends on
-the ring representation, serialization width, and Teichmuller generator behavior.
+Start P2 by porting Teichmuller and domain logic. Do not touch prover or verifier code until P2 has
+deterministic C++ parity tests, because every later protocol check depends on the ring
+representation, serialization width, and Teichmuller generator behavior.
+
+## 11. Phase Review Log
+
+### P1. Galois Ring Core
+
+Status: complete in this branch; review gates passed.
+
+Implemented:
+
+- `src/algebra/galois_ring/context.rs`: `GrConfig`, `GrContext`, structured `GrError`, metadata,
+  element construction, add/sub/neg/mul/square/pow, unit detection, Newton-lifted inverse,
+  batch inverse, deterministic random sampling, and canonical little-endian serialization.
+- `src/algebra/galois_ring/element.rs`: owned coefficient-vector `GrElem`.
+- `src/algebra/galois_ring/poly_f2.rs`: binary polynomial arithmetic, irreducibility testing,
+  deterministic irreducible polynomial selection, and GF(2) inverse modulo the defining
+  polynomial.
+- `src/algebra/mod.rs`: public `galois_ring` module export.
+
+Review evidence:
+
+- `cargo fmt --check`: passed.
+- `cargo clippy --lib --all-features --locked -- -D warnings`: passed.
+- `cargo test --lib galois_ring`: passed, 12 tests.
+- `cargo test --lib`: passed, 124 passed and 25 ignored.
+- `git diff --check`: passed.
+- C++ reference smoke: `$HOME/STIR&WHIRoverGR/build/test_gr_basic` passed all tests.
+
+Known boundary:
+
+- P1 supports `p = 2` and `s <= 64`.
+- The Rust ring uses deterministic irreducible binary polynomial selection. It is suitable for the
+  Rust prototype and P1 algebra tests. Byte-for-byte C++ defining-polynomial compatibility remains a
+  P2/P3 decision if strict C++ transcript/proof compatibility is required.

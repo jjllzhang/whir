@@ -1,5 +1,6 @@
 pub mod embedding;
 pub mod fields;
+pub mod galois_ring;
 pub mod linear_form;
 mod multilinear;
 pub mod ntt;
