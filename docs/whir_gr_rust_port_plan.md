@@ -365,7 +365,7 @@ These are the only decisions that can materially change the implementation shape
 | Done | P3 | Serialization, transcript, Merkle | `cargo test --lib whir_gr` |
 | Done | P4 | Multiquadratic layer | `cargo test --lib multiquadratic` |
 | Done | P5 | Constraints and ternary sumcheck | `cargo test --lib constraint` |
-| Todo | P6 | Repeated ternary folding | `cargo test --lib whir_gr_folding` |
+| Done | P6 | Repeated ternary folding | `cargo test --lib folding` |
 | Todo | P7 | Unique-decoding selector | `cargo test --lib whir_gr_soundness` |
 | Todo | P8 | Prover and verifier | `cargo test --lib whir_gr_roundtrip` |
 | Todo | P9 | Benchmark parity surface | `cargo run --release --bin whir_gr_benchmark -- --help` |
@@ -373,8 +373,8 @@ These are the only decisions that can materially change the implementation shape
 
 ## 10. Immediate Next Step
 
-Start P6 by porting repeated ternary folding and virtual fold query helpers. Keep prover/verifier
-code out of scope until P6 establishes deterministic folding payload semantics.
+Start P7 by porting the unique-decoding parameter selector and its validation checks. Keep
+prover/verifier code out of scope until P7 exposes stable public parameters.
 
 ## 11. Phase Review Log
 
@@ -527,3 +527,29 @@ Confirmed boundary:
 - P5 implements the correctness-first, enumerative honest-sumcheck path. It does not yet port the
   C++ factor-table or cache-oriented fast path; those optimizations should wait until prover,
   verifier, and benchmark parity are in place.
+
+### P6. Repeated Ternary Folding
+
+Status: complete in this branch; review gates passed.
+
+Implemented:
+
+- `src/protocols/whir_gr/folding.rs`: generic ring Lagrange `fold_eval`, ternary fold-table
+  construction, repeated ternary folding across challenge levels, recursive virtual-fold query
+  index expansion, sparse repeated-fold evaluation from points/values, and leaf-payload based
+  virtual query evaluation.
+- `src/protocols/whir_gr/mod.rs`: public folding module export.
+
+Review evidence:
+
+- `cargo fmt --check`: passed.
+- `cargo clippy --lib --all-features --locked -- -D warnings`: passed.
+- `cargo test --lib folding`: passed, including b=1, b=2, b=3 sparse-vs-full cases.
+- `cargo test --lib`: passed, 167 passed and 25 ignored.
+- `git diff --check`: passed.
+- C++ reference smoke: `$HOME/STIR&WHIRoverGR/build/test_whir_folding` passed all tests.
+
+Confirmed boundary:
+
+- P6 implements a correctness-first generic interpolation path. It intentionally does not port
+  the C++ `StructuredFiberCache`, parallel chunking, or fold-cache optimizations yet.
