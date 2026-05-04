@@ -366,15 +366,15 @@ These are the only decisions that can materially change the implementation shape
 | Done | P4 | Multiquadratic layer | `cargo test --lib multiquadratic` |
 | Done | P5 | Constraints and ternary sumcheck | `cargo test --lib constraint` |
 | Done | P6 | Repeated ternary folding | `cargo test --lib folding` |
-| Todo | P7 | Unique-decoding selector | `cargo test --lib whir_gr_soundness` |
+| Done | P7 | Unique-decoding selector | `cargo test --lib soundness` |
 | Todo | P8 | Prover and verifier | `cargo test --lib whir_gr_roundtrip` |
 | Todo | P9 | Benchmark parity surface | `cargo run --release --bin whir_gr_benchmark -- --help` |
 | Todo | P10 | Release candidate sweep | fmt, tests, clippy, parity row |
 
 ## 10. Immediate Next Step
 
-Start P7 by porting the unique-decoding parameter selector and its validation checks. Keep
-prover/verifier code out of scope until P7 exposes stable public parameters.
+Start P8 by wiring the WHIR_GR prover/verifier round trip on top of the completed algebra,
+transcript, multiquadratic, constraint, folding, and selector layers.
 
 ## 11. Phase Review Log
 
@@ -553,3 +553,32 @@ Confirmed boundary:
 
 - P6 implements a correctness-first generic interpolation path. It intentionally does not port
   the C++ `StructuredFiberCache`, parallel chunking, or fold-cache optimizations yet.
+
+### P7. Unique-Decoding Parameter Selector
+
+Status: complete in this branch; review gates passed.
+
+Implemented:
+
+- `src/protocols/whir_gr/soundness.rs`: Rust port of the unique-decoding input structs, selected
+  public-parameter summary structs, per-layer summaries, input validation, layer-width schedule,
+  required 3-adic power calculation, domain divisibility checks, multiplicative order modulo odd
+  domain sizes, fixed/auto extension-degree selection, repetition-count estimates, algebraic bound
+  accounting, effective-security calculation, and infeasible-guard notes.
+- `src/protocols/whir_gr/mod.rs`: public soundness module export.
+
+Review evidence:
+
+- `cargo fmt --check`: passed.
+- `cargo clippy --lib --all-features --locked -- -D warnings`: passed.
+- `cargo test --lib soundness`: passed, 10 tests.
+- `cargo test --lib`: passed, 177 passed and 25 ignored.
+- `git diff --check`: passed.
+- C++ reference smoke: `$HOME/STIR&WHIRoverGR/build/test_whir_soundness` passed all tests.
+
+Confirmed boundary:
+
+- P7 matches the C++ selector on the small smoke case and the `bench/presets/whir.json` fixed
+  `r=162` rows for `m=4..10`. It uses `u128` for algebraic-bound accounting, which covers the
+  current prototype and benchmark preset range; a future very-large-parameter selector may need a
+  bigint-backed bound to fully mirror the C++ NTL `ZZ` implementation.
