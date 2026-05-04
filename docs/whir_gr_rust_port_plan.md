@@ -362,7 +362,7 @@ These are the only decisions that can materially change the implementation shape
 | Done | P0 | Branch and plan document | `feature/whir-gr`, this file exists |
 | Done | P1 | Galois ring core | `cargo test --lib galois_ring` |
 | Done | P2 | Teichmuller and domains | `cargo test --lib galois_ring` |
-| Todo | P3 | Serialization, transcript, Merkle | `cargo test --lib whir_gr_serialization whir_gr_merkle` |
+| Done | P3 | Serialization, transcript, Merkle | `cargo test --lib whir_gr` |
 | Todo | P4 | Multiquadratic layer | `cargo test --lib whir_gr_multiquadratic` |
 | Todo | P5 | Constraints and ternary sumcheck | `cargo test --lib whir_gr_constraint` |
 | Todo | P6 | Repeated ternary folding | `cargo test --lib whir_gr_folding` |
@@ -373,9 +373,9 @@ These are the only decisions that can materially change the implementation shape
 
 ## 10. Immediate Next Step
 
-Start P3 by adding WHIR_GR serialization, transcript, and Merkle helpers. Do not touch prover or
-verifier code until P3 has deterministic byte-level tests, because every later protocol check
-depends on stable serialization, Merkle roots, and challenge ordering.
+Start P4 by porting the multilinear and multiquadratic polynomial layer. Keep prover/verifier code
+out of scope until P4, P5, and P6 establish deterministic polynomial, constraint, and folding
+helpers.
 
 ## 11. Phase Review Log
 
@@ -441,3 +441,34 @@ Confirmed boundary:
   Teichmuller generator bytes, domain root bytes, or serialized `omega` bytes.
 - P2 therefore keeps Rust deterministic and protocol-self-consistent, with C++ used as behavior and
   test-shape reference rather than as a byte-level fixture oracle.
+
+### P3. Serialization, Transcript, and Merkle
+
+Status: complete in this branch; review gates passed.
+
+Implemented:
+
+- `src/protocols/whir_gr/common.rs`: WHIR_GR public-parameter, commitment, sumcheck polynomial,
+  round proof, proof, and opening structs for later protocol phases.
+- `src/protocols/whir_gr/serialization.rs`: canonical length-prefixed byte writer plus serializers
+  for ring elements, ring vectors, domains, public parameters, sumcheck polynomials, Merkle proofs,
+  round proofs, full proofs, and openings.
+- `src/protocols/whir_gr/transcript.rs`: BLAKE3-based labeled transcript with deterministic byte
+  challenges, index challenges, unique-position derivation, and Teichmuller challenge sampling.
+- `src/protocols/whir_gr/merkle.rs`: byte-oriented Merkle tree over serialized ring payloads,
+  opening proof generation, verification, tamper rejection, and oracle leaf/tree helpers.
+- `src/protocols/mod.rs`: public `whir_gr` protocol module export.
+
+Review evidence:
+
+- `cargo fmt --check`: passed.
+- `cargo clippy --lib --all-features --locked -- -D warnings`: passed.
+- `cargo test --lib whir_gr`: passed, 10 tests.
+- `cargo test --lib`: passed, 146 passed and 25 ignored.
+- `git diff --check`: passed.
+- C++ reference smoke: `$HOME/STIR&WHIRoverGR/build/test_crypto` passed all tests.
+
+Confirmed boundary:
+
+- P3 provides deterministic Rust-native transcript/Merkle behavior. It intentionally does not
+  attempt byte-for-byte C++ transcript compatibility, matching the user's P2 clarification.
