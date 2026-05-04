@@ -25,6 +25,8 @@ pub enum GrError {
     NonUnit,
     InvalidSubgroupSize { size: u64 },
     InvalidDomain(&'static str),
+    InvalidPolynomial(&'static str),
+    ArithmeticOverflow(&'static str),
     IndexOutOfRange { index: u64, size: u64 },
     DifferentRings,
     NoIrreduciblePolynomial { degree: usize, attempts: usize },
@@ -55,6 +57,10 @@ impl fmt::Display for GrError {
                 write!(formatter, "invalid Teichmuller subgroup size {size}")
             }
             Self::InvalidDomain(message) => write!(formatter, "invalid domain: {message}"),
+            Self::InvalidPolynomial(message) => {
+                write!(formatter, "invalid polynomial: {message}")
+            }
+            Self::ArithmeticOverflow(message) => write!(formatter, "arithmetic overflow: {message}"),
             Self::IndexOutOfRange { index, size } => {
                 write!(formatter, "domain index {index} is out of range for size {size}")
             }

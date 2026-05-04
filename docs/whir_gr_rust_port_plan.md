@@ -363,7 +363,7 @@ These are the only decisions that can materially change the implementation shape
 | Done | P1 | Galois ring core | `cargo test --lib galois_ring` |
 | Done | P2 | Teichmuller and domains | `cargo test --lib galois_ring` |
 | Done | P3 | Serialization, transcript, Merkle | `cargo test --lib whir_gr` |
-| Todo | P4 | Multiquadratic layer | `cargo test --lib whir_gr_multiquadratic` |
+| Done | P4 | Multiquadratic layer | `cargo test --lib multiquadratic` |
 | Todo | P5 | Constraints and ternary sumcheck | `cargo test --lib whir_gr_constraint` |
 | Todo | P6 | Repeated ternary folding | `cargo test --lib whir_gr_folding` |
 | Todo | P7 | Unique-decoding selector | `cargo test --lib whir_gr_soundness` |
@@ -373,9 +373,8 @@ These are the only decisions that can materially change the implementation shape
 
 ## 10. Immediate Next Step
 
-Start P4 by porting the multilinear and multiquadratic polynomial layer. Keep prover/verifier code
-out of scope until P4, P5, and P6 establish deterministic polynomial, constraint, and folding
-helpers.
+Start P5 by porting the WHIR_GR constraint and ternary sumcheck helper layer. Keep prover/verifier
+code out of scope until P5 and P6 establish deterministic constraint and folding helpers.
 
 ## 11. Phase Review Log
 
@@ -472,3 +471,32 @@ Confirmed boundary:
 
 - P3 provides deterministic Rust-native transcript/Merkle behavior. It intentionally does not
   attempt byte-for-byte C++ transcript compatibility, matching the user's P2 clarification.
+
+### P4. Multilinear and Multiquadratic Layer
+
+Status: complete in this branch; review gates passed.
+
+Implemented:
+
+- `src/protocols/whir_gr/multiquadratic.rs`: checked `pow2`/`pow3`, base-3 little-endian
+  encode/decode, `pow_m`, `MultiQuadraticPolynomial`, `MultilinearPolynomial`,
+  multiquadratic evaluation, univariate `evaluate_pow`, prefix restriction, multilinear
+  evaluation, and multilinear-to-multiquadratic embedding.
+- `src/algebra/galois_ring/context.rs`: structured polynomial/overflow error variants used by
+  the polynomial layer.
+- `src/protocols/whir_gr/mod.rs`: public multiquadratic module export.
+
+Review evidence:
+
+- `cargo fmt --check`: passed.
+- `cargo clippy --lib --all-features --locked -- -D warnings`: passed.
+- `cargo test --lib multiquadratic`: passed, 8 tests.
+- `cargo test --lib`: passed, 154 passed and 25 ignored.
+- `git diff --check`: passed.
+- C++ reference smoke: `$HOME/STIR&WHIRoverGR/build/test_whir_multiquadratic` passed all tests.
+- C++ reference smoke: `$HOME/STIR&WHIRoverGR/build/test_whir_multilinear` passed all tests.
+
+Confirmed boundary:
+
+- P4 uses Rust-native ring/domain choices from P1/P2. It checks structural behavior and algebraic
+  identities rather than byte-for-byte C++ coefficient fixtures.
