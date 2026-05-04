@@ -1,6 +1,6 @@
 # WHIR_GR Rust Port Execution Plan
 
-Status: draft implementation tracker
+Status: prototype implementation tracker complete
 Branch: `feature/whir-gr`
 Primary target: prototype Rust implementation of the C++ `whir_gr_ud` unique-decoding WHIR-over-Galois-ring PCS.
 
@@ -369,12 +369,13 @@ These are the only decisions that can materially change the implementation shape
 | Done | P7 | Unique-decoding selector | `cargo test --lib soundness` |
 | Done | P8 | Prover and verifier | `cargo test --lib prover` |
 | Done | P9 | Benchmark parity surface | `cargo run --release --bin whir_gr_benchmark -- --help` |
-| Todo | P10 | Release candidate sweep | fmt, tests, clippy, parity row |
+| Done | P10 | Release candidate sweep | fmt, tests, clippy, parity row |
 
 ## 10. Immediate Next Step
 
-Start P10 by running the release-candidate sweep, recording remaining known deviations, and
-checking that all tracker phases are complete.
+All P0-P10 tracker phases are complete. Future work should focus on performance optimization,
+larger-parameter calibration, and any optional C++ fixture exporters needed for stricter parity
+analysis.
 
 ## 11. Phase Review Log
 
@@ -641,3 +642,33 @@ Confirmed boundary:
 - P9 provides a Rust-native benchmark/parity row surface. Timings are not expected to match C++
   because P5/P6/P8 intentionally use correctness-first generic paths rather than the C++ optimized
   caches and parallel folding/encoding paths.
+
+### P10. Release Candidate Sweep
+
+Status: complete in this branch; release gates passed.
+
+Review evidence:
+
+- `cargo fmt --check`: passed.
+- `cargo test --all-targets`: passed, including library tests, all binaries, and bench harness
+  test entrypoints.
+- `cargo clippy --all-targets --all-features --locked -- -D warnings`: passed.
+- `cargo run --release --bin whir_gr_benchmark -- --csv-header --m 3 --bmax 1 --lambda 32 --rho0 1/3 --r 54 --n 81 --repetitions 1 --polynomial multilinear`: passed and emitted a verified Rust `whir_gr_ud` row.
+- `$HOME/STIR&WHIRoverGR/build/bench_time --protocol whir_gr_ud --p 2 --k-exp 16 --r 54 --n 81 --d 27 --lambda 32 --pow-bits 0 --hash-profile WHIR_NATIVE --whir-m 3 --whir-bmax 1 --whir-r 54 --whir-rho0 1/3 --whir-polynomial multilinear --warmup 0 --reps 1 --threads 1 --format csv`: passed and emitted the matching C++ parameter row.
+
+Small parity row:
+
+- Shared parameters: `protocol=whir_gr_ud`, `p=2`, `k_exp=16`, `r=54`, `n=81`, `rate=1/3`,
+  `lambda=32`, `m=3`, `bmax=1`, multilinear polynomial family.
+- Rust row: `effective_security_bits=33`, `serialized_bytes_actual=40568`.
+- C++ row: `effective_security_bits=33`, `serialized_bytes_actual=17216`.
+
+Known deviations:
+
+- Rust proof bytes are not expected to match C++ proof bytes. The Rust implementation uses
+  Rust-native transcript labels, Merkle payload/proof serialization, and correctness-first proof
+  structs, consistent with the user's clarification that strict C++ byte compatibility is not
+  required.
+- P5/P6/P8 prioritize correctness over the C++ optimized fast paths. Performance work should port
+  structured fiber caches, dense/parallel encoding, and folding caches only after additional
+  benchmark calibration.
