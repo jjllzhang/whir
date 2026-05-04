@@ -361,7 +361,7 @@ These are the only decisions that can materially change the implementation shape
 | --- | --- | --- | --- |
 | Done | P0 | Branch and plan document | `feature/whir-gr`, this file exists |
 | Done | P1 | Galois ring core | `cargo test --lib galois_ring` |
-| Todo | P2 | Teichmuller and domains | `cargo test --lib teichmuller domain` |
+| Done | P2 | Teichmuller and domains | `cargo test --lib galois_ring` |
 | Todo | P3 | Serialization, transcript, Merkle | `cargo test --lib whir_gr_serialization whir_gr_merkle` |
 | Todo | P4 | Multiquadratic layer | `cargo test --lib whir_gr_multiquadratic` |
 | Todo | P5 | Constraints and ternary sumcheck | `cargo test --lib whir_gr_constraint` |
@@ -373,9 +373,9 @@ These are the only decisions that can materially change the implementation shape
 
 ## 10. Immediate Next Step
 
-Start P2 by porting Teichmuller and domain logic. Do not touch prover or verifier code until P2 has
-deterministic C++ parity tests, because every later protocol check depends on the ring
-representation, serialization width, and Teichmuller generator behavior.
+Start P3 by adding WHIR_GR serialization, transcript, and Merkle helpers. Do not touch prover or
+verifier code until P3 has deterministic byte-level tests, because every later protocol check
+depends on stable serialization, Merkle roots, and challenge ordering.
 
 ## 11. Phase Review Log
 
@@ -409,3 +409,35 @@ Known boundary:
 - The Rust ring uses deterministic irreducible binary polynomial selection. It is suitable for the
   Rust prototype and P1 algebra tests. Byte-for-byte C++ defining-polynomial compatibility remains a
   P2/P3 decision if strict C++ transcript/proof compatibility is required.
+
+### P2. Teichmuller and Domains
+
+Status: complete in this branch; review gates passed.
+
+Implemented:
+
+- `src/algebra/galois_ring/teichmuller.rs`: deterministic Teichmuller projection, subgroup-size
+  support checks for divisibility by `2^r - 1`, subgroup generator search, exact-order checks,
+  Teichmuller membership, subgroup enumeration, and index-based Teichmuller element access.
+- `src/algebra/galois_ring/domain.rs`: `Domain` over `Arc<GrContext>` with subgroup/coset
+  constructors, element access, full enumeration, membership check, Teichmuller-subset check,
+  `scale`, `scale_offset`, `pow_map`, and disjointness checks.
+- `src/algebra/galois_ring/context.rs`: limb-vector exponentiation helper for large
+  `2^r - 1`-style exponents and structured errors for domain/subgroup failures.
+- `src/algebra/galois_ring/mod.rs`: public exports for Teichmuller and domain APIs.
+
+Review evidence:
+
+- `cargo fmt --check`: passed.
+- `cargo clippy --lib --all-features --locked -- -D warnings`: passed.
+- `cargo test --lib galois_ring`: passed, 24 tests.
+- `cargo test --lib`: passed, 136 passed and 25 ignored.
+- `git diff --check`: passed.
+- C++ reference smoke: `$HOME/STIR&WHIRoverGR/build/test_domain` passed all tests.
+
+Confirmed boundary:
+
+- The user confirmed Rust does not need byte-for-byte compatibility with C++ defining polynomials,
+  Teichmuller generator bytes, domain root bytes, or serialized `omega` bytes.
+- P2 therefore keeps Rust deterministic and protocol-self-consistent, with C++ used as behavior and
+  test-shape reference rather than as a byte-level fixture oracle.

@@ -23,6 +23,10 @@ pub enum GrError {
     CoefficientLength { expected: usize, actual: usize },
     DeserializeSize { expected: usize, actual: usize },
     NonUnit,
+    InvalidSubgroupSize { size: u64 },
+    InvalidDomain(&'static str),
+    IndexOutOfRange { index: u64, size: u64 },
+    DifferentRings,
     NoIrreduciblePolynomial { degree: usize, attempts: usize },
     InvalidDefiningPolynomial(&'static str),
 }
@@ -47,6 +51,14 @@ impl fmt::Display for GrError {
                 "serialized element size mismatch: expected {expected}, got {actual}"
             ),
             Self::NonUnit => formatter.write_str("operation requires a unit element"),
+            Self::InvalidSubgroupSize { size } => {
+                write!(formatter, "invalid Teichmuller subgroup size {size}")
+            }
+            Self::InvalidDomain(message) => write!(formatter, "invalid domain: {message}"),
+            Self::IndexOutOfRange { index, size } => {
+                write!(formatter, "domain index {index} is out of range for size {size}")
+            }
+            Self::DifferentRings => formatter.write_str("operation requires matching ring contexts"),
             Self::NoIrreduciblePolynomial { degree, attempts } => write!(
                 formatter,
                 "failed to find irreducible binary polynomial of degree {degree} after {attempts} attempts"
@@ -229,6 +241,22 @@ impl GrContext {
             }
             exponent >>= 1;
             if exponent != 0 {
+                power = self.square(&power);
+            }
+        }
+        result
+    }
+
+    pub fn pow_words_le(&self, base: &GrElem, exponent_words: &[u64]) -> GrElem {
+        let mut result = self.one();
+        let mut power = base.clone();
+        for &word in exponent_words {
+            let mut remaining = word;
+            for _ in 0..u64::BITS {
+                if remaining & 1 == 1 {
+                    result = self.mul(&result, &power);
+                }
+                remaining >>= 1;
                 power = self.square(&power);
             }
         }
