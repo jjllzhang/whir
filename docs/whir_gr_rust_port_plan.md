@@ -368,13 +368,13 @@ These are the only decisions that can materially change the implementation shape
 | Done | P6 | Repeated ternary folding | `cargo test --lib folding` |
 | Done | P7 | Unique-decoding selector | `cargo test --lib soundness` |
 | Done | P8 | Prover and verifier | `cargo test --lib prover` |
-| Todo | P9 | Benchmark parity surface | `cargo run --release --bin whir_gr_benchmark -- --help` |
+| Done | P9 | Benchmark parity surface | `cargo run --release --bin whir_gr_benchmark -- --help` |
 | Todo | P10 | Release candidate sweep | fmt, tests, clippy, parity row |
 
 ## 10. Immediate Next Step
 
-Start P9 by adding a WHIR_GR benchmark/parity CLI surface that can emit comparable rows for the
-Rust-native unique-decoding prototype.
+Start P10 by running the release-candidate sweep, recording remaining known deviations, and
+checking that all tracker phases are complete.
 
 ## 11. Phase Review Log
 
@@ -612,3 +612,32 @@ Confirmed boundary:
 - P8 is a Rust-native transcript/proof implementation. It follows the C++ unique-decoding protocol
   flow and test shapes, but it intentionally does not attempt byte-for-byte C++ proof or transcript
   compatibility.
+
+### P9. Benchmark and C++ Parity Surface
+
+Status: complete in this branch; review gates passed.
+
+Implemented:
+
+- `src/bin/whir_gr_benchmark.rs`: standalone WHIR_GR benchmark CLI with knobs for `p`, `k_exp`,
+  fixed `r`, expected `n`, variable count `m`, `bmax`, `lambda`, `rho0`, repetitions, seed,
+  polynomial family, and selector guards. It emits CSV columns compatible with the P9 tracker:
+  `protocol,p,k_exp,r,n,rate,lambda,effective_security_bits,commit_ms,open_ms,verify_ms,
+  serialized_bytes_actual`.
+- `src/protocols/whir_gr/constraint.rs`: small all-targets Clippy cleanup in a P5 test.
+
+Review evidence:
+
+- `cargo fmt --check`: passed.
+- `cargo clippy --all-targets --all-features --locked -- -D warnings`: passed.
+- `cargo test --lib`: passed, 179 passed and 25 ignored.
+- `cargo run --release --bin whir_gr_benchmark -- --help`: passed.
+- `cargo run --release --bin whir_gr_benchmark -- --csv-header`: passed and emitted a verified
+  `whir_gr_ud` CSV row.
+- `git diff --check`: passed.
+
+Confirmed boundary:
+
+- P9 provides a Rust-native benchmark/parity row surface. Timings are not expected to match C++
+  because P5/P6/P8 intentionally use correctness-first generic paths rather than the C++ optimized
+  caches and parallel folding/encoding paths.

@@ -628,9 +628,7 @@ mod tests {
         }
         assert!(!check_sumcheck_identity(&ctx, &grid, &tampered, &current_sigma, 4).unwrap());
 
-        let mut declared_too_large = WhirGrSumcheckPolynomial {
-            coefficients: honest.coefficients,
-        };
+        let mut declared_too_large = honest;
         declared_too_large.coefficients.resize(6, ctx.zero());
         assert!(!check_sumcheck_degree(&declared_too_large, 4));
     }
