@@ -78,13 +78,7 @@ impl Config {
         (1 << (self.layers.len() + 1)) - 1
     }
 
-    #[cfg_attr(feature = "tracing", instrument(skip(prover_state, leaves), fields(self = %self)))]
-    pub fn commit<H, R>(&self, prover_state: &mut ProverState<H, R>, leaves: Vec<Hash>) -> Witness
-    where
-        H: DuplexSpongeInterface,
-        R: RngCore + CryptoRng,
-        Hash: ProverMessage<[H::U]>,
-    {
+    pub fn build(&self, leaves: Vec<Hash>) -> (Commitment, Witness) {
         assert_eq!(
             leaves.len(),
             self.num_leaves,
@@ -120,10 +114,19 @@ impl Config {
             remaining = next_remaining;
         }
 
-        // Commit to the root hash.
-        prover_state.prover_message(&previous[0]);
+        (Commitment { hash: previous[0] }, Witness { nodes })
+    }
 
-        Witness { nodes }
+    #[cfg_attr(feature = "tracing", instrument(skip(prover_state, leaves), fields(self = %self)))]
+    pub fn commit<H, R>(&self, prover_state: &mut ProverState<H, R>, leaves: Vec<Hash>) -> Witness
+    where
+        H: DuplexSpongeInterface,
+        R: RngCore + CryptoRng,
+        Hash: ProverMessage<[H::U]>,
+    {
+        let (commitment, witness) = self.build(leaves);
+        prover_state.prover_message(&commitment.hash);
+        witness
     }
 
     pub fn receive_commitment<H>(
@@ -270,11 +273,75 @@ impl Config {
         verify!(hashes == [commitment.hash]);
         Ok(())
     }
+
+    pub fn open_paths(
+        &self,
+        witness: &Witness,
+        indices: &[usize],
+    ) -> VerificationResult<Vec<Hash>> {
+        verify!(witness.nodes.len() == self.num_nodes());
+        verify!(indices.iter().all(|&i| i < self.num_leaves));
+
+        let depth = self.layers.len();
+        let mut sibling_hashes = Vec::with_capacity(indices.len() * depth);
+        for &index in indices {
+            let mut current_index = index;
+            let mut layer_offset = 0usize;
+            let mut layer_len = 1usize << depth;
+            while layer_len > 1 {
+                sibling_hashes.push(witness.nodes[layer_offset + (current_index ^ 1)]);
+                layer_offset += layer_len;
+                layer_len /= 2;
+                current_index >>= 1;
+            }
+        }
+        Ok(sibling_hashes)
+    }
+
+    pub fn verify_paths(
+        &self,
+        commitment: &Commitment,
+        indices: &[usize],
+        leaf_hashes: &[Hash],
+        sibling_hashes: &[Hash],
+    ) -> VerificationResult<()> {
+        verify!(indices.len() == leaf_hashes.len());
+        verify!(indices.iter().all(|&i| i < self.num_leaves));
+
+        let depth = self.layers.len();
+        verify!(sibling_hashes.len() == indices.len() * depth);
+        let mut siblings = sibling_hashes.iter();
+        for (&index, &leaf_hash) in indices.iter().zip(leaf_hashes) {
+            let mut current_index = index;
+            let mut current = leaf_hash;
+            for layer in self.layers.iter().rev() {
+                let sibling = siblings.next().ok_or(VerificationError)?;
+                current = if current_index & 1 == 0 {
+                    hash_pair(layer.hash_id, &current, sibling)?
+                } else {
+                    hash_pair(layer.hash_id, sibling, &current)?
+                };
+                current_index >>= 1;
+            }
+            verify!(current == commitment.hash);
+        }
+        Ok(())
+    }
 }
 
 impl Witness {
     pub const fn num_nodes(&self) -> usize {
         self.nodes.len()
+    }
+}
+
+impl Commitment {
+    pub const fn new(hash: Hash) -> Self {
+        Self { hash }
+    }
+
+    pub const fn hash(&self) -> Hash {
+        self.hash
     }
 }
 
@@ -301,6 +368,18 @@ fn parallel_hash(engine: &dyn HashEngine, size: usize, input: &[u8], output: &mu
     } else {
         engine.hash_many(size, input, output);
     }
+}
+
+fn hash_pair(hash_id: EngineId, lhs: &Hash, rhs: &Hash) -> VerificationResult<Hash> {
+    let mut out = Hash::default();
+    let mut input = [0u8; 64];
+    input[..32].copy_from_slice(&lhs.0);
+    input[32..].copy_from_slice(&rhs.0);
+    ENGINES
+        .retrieve(hash_id)
+        .ok_or(VerificationError)?
+        .hash_many(input.len(), &input, std::slice::from_mut(&mut out));
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -355,6 +434,28 @@ pub(crate) mod tests {
                 &[Hash([13; 32]), Hash([42; 32])],
             )
             .unwrap();
+    }
+
+    #[test]
+    fn explicit_paths_should_verify_without_transcript_hints() {
+        crate::tests::init();
+        let config = Config::with_hash(BLAKE3, 8);
+        let leaves = (0..config.num_leaves)
+            .map(|i| Hash([i as u8; 32]))
+            .collect::<Vec<_>>();
+        let (commitment, witness) = config.build(leaves.clone());
+
+        let indices = [1, 6];
+        let paths = config.open_paths(&witness, &indices).unwrap();
+        config
+            .verify_paths(&commitment, &indices, &[leaves[1], leaves[6]], &paths)
+            .unwrap();
+
+        let mut bad_paths = paths;
+        bad_paths[0].0[0] ^= 1;
+        assert!(config
+            .verify_paths(&commitment, &indices, &[leaves[1], leaves[6]], &bad_paths)
+            .is_err());
     }
 
     #[test]

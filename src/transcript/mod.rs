@@ -191,6 +191,14 @@ where
     }
 
     #[cfg_attr(test, track_caller)]
+    pub fn public_message<T>(&mut self, message: &T)
+    where
+        T: Encoding<[H::U]> + ?Sized,
+    {
+        self.inner.public_message(message);
+    }
+
+    #[cfg_attr(test, track_caller)]
     pub fn prover_message<T>(&mut self, message: &T)
     where
         T: Encoding<[H::U]> + NargSerialize + ?Sized,
@@ -288,6 +296,14 @@ where
 
     pub const fn as_spongefish(&mut self) -> &mut spongefish::VerifierState<'a, H> {
         &mut self.inner
+    }
+
+    #[cfg_attr(test, track_caller)]
+    pub fn public_message<T>(&mut self, message: &T)
+    where
+        T: Encoding<[H::U]> + ?Sized,
+    {
+        self.inner.public_message(message);
     }
 
     #[cfg_attr(debug_assertions, track_caller)]

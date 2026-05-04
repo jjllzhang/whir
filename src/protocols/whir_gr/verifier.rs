@@ -11,9 +11,13 @@ use crate::{
             indexed_label, opening_transcript, positions_to_sorted_usize,
             validate_public_parameters,
         },
-        serialization::serialize_sumcheck_polynomial,
+        serialization::{serialize_sumcheck_polynomial, WhirGrOpeningPayload},
         transcript::Transcript,
     },
+    transcript::{
+        DuplexSpongeInterface, ProverMessage, VerificationError, VerificationResult, VerifierState,
+    },
+    verify,
 };
 
 #[derive(Clone, Debug)]
@@ -89,7 +93,11 @@ impl<'a> WhirGrVerifier<'a> {
         {
             return Ok(false);
         }
-        if !ByteMerkleTree::verify(current_root, &opening.proof.final_openings)? {
+        if !ByteMerkleTree::verify(
+            self.public_params.hash_id,
+            current_root,
+            &opening.proof.final_openings,
+        )? {
             return Ok(false);
         }
         for payload in &opening.proof.final_openings.leaf_payloads {
@@ -99,6 +107,39 @@ impl<'a> WhirGrVerifier<'a> {
         }
 
         Ok(true)
+    }
+
+    pub fn receive_commitment<H>(
+        &self,
+        verifier_state: &mut VerifierState<H>,
+    ) -> VerificationResult<WhirGrCommitment>
+    where
+        H: DuplexSpongeInterface,
+        Hash: ProverMessage<[H::U]>,
+    {
+        let oracle_root = verifier_state.prover_message()?;
+        Ok(WhirGrCommitment { oracle_root })
+    }
+
+    pub fn verify_transcript<H>(
+        &self,
+        verifier_state: &mut VerifierState<H>,
+        commitment: &WhirGrCommitment,
+        point: &[GrElem],
+    ) -> VerificationResult<GrElem>
+    where
+        H: DuplexSpongeInterface,
+        WhirGrOpeningPayload: ProverMessage<[H::U]>,
+    {
+        let payload: WhirGrOpeningPayload = verifier_state.prover_message()?;
+        let opening = payload
+            .into_opening(&self.public_params.ctx)
+            .map_err(|_| VerificationError)?;
+        let verified = self
+            .verify(commitment, point, &opening)
+            .map_err(|_| VerificationError)?;
+        verify!(verified);
+        Ok(opening.value)
     }
 
     fn shape_valid(
@@ -194,7 +235,11 @@ fn verify_round(
     {
         return Ok(None);
     }
-    if !ByteMerkleTree::verify(input.current_root, &input.round.virtual_fold_openings)? {
+    if !ByteMerkleTree::verify(
+        params.hash_id,
+        input.current_root,
+        &input.round.virtual_fold_openings,
+    )? {
         return Ok(None);
     }
 

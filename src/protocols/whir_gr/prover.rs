@@ -1,3 +1,5 @@
+use ark_std::rand::{CryptoRng, RngCore};
+
 use crate::{
     algebra::galois_ring::{Domain, GrElem, GrError, Result},
     hash::Hash,
@@ -14,9 +16,11 @@ use crate::{
         multiquadratic::{pow3_checked, pow_m, MultiQuadraticPolynomial, MultilinearPolynomial},
         serialization::{
             serialize_public_parameters, serialize_ring_vector, serialize_sumcheck_polynomial,
+            WhirGrOpeningPayload,
         },
         transcript::Transcript,
     },
+    transcript::{DuplexSpongeInterface, ProverMessage, ProverState},
 };
 
 #[derive(Clone, Debug)]
@@ -69,7 +73,11 @@ impl<'a> WhirGrProver<'a> {
             &self.public_params.initial_domain,
             polynomial,
         )?;
-        let initial_tree = build_oracle_tree(&self.public_params.ctx, &initial_oracle)?;
+        let initial_tree = build_oracle_tree(
+            self.public_params.hash_id,
+            &self.public_params.ctx,
+            &initial_oracle,
+        )?;
         let oracle_root = initial_tree.root();
         let commitment = WhirGrCommitment { oracle_root };
         let state = WhirGrCommitmentState {
@@ -82,11 +90,42 @@ impl<'a> WhirGrProver<'a> {
         Ok((commitment, state))
     }
 
+    pub fn commit_transcript<H, R>(
+        &self,
+        prover_state: &mut ProverState<H, R>,
+        polynomial: &MultiQuadraticPolynomial,
+    ) -> Result<(WhirGrCommitment, WhirGrCommitmentState)>
+    where
+        H: DuplexSpongeInterface,
+        R: RngCore + CryptoRng,
+        Hash: ProverMessage<[H::U]>,
+    {
+        let (commitment, state) = self.commit(polynomial)?;
+        prover_state.prover_message(&commitment.oracle_root);
+        Ok((commitment, state))
+    }
+
     pub fn commit_multilinear(
         &self,
         polynomial: &MultilinearPolynomial,
     ) -> Result<(WhirGrCommitment, WhirGrCommitmentState)> {
         self.commit(&polynomial.to_multi_quadratic(&self.public_params.ctx)?)
+    }
+
+    pub fn commit_multilinear_transcript<H, R>(
+        &self,
+        prover_state: &mut ProverState<H, R>,
+        polynomial: &MultilinearPolynomial,
+    ) -> Result<(WhirGrCommitment, WhirGrCommitmentState)>
+    where
+        H: DuplexSpongeInterface,
+        R: RngCore + CryptoRng,
+        Hash: ProverMessage<[H::U]>,
+    {
+        self.commit_transcript(
+            prover_state,
+            &polynomial.to_multi_quadratic(&self.public_params.ctx)?,
+        )
     }
 
     pub fn open(
@@ -148,6 +187,27 @@ impl<'a> WhirGrProver<'a> {
         )?)?;
         Ok(opening)
     }
+
+    pub fn open_transcript<H, R>(
+        &self,
+        prover_state: &mut ProverState<H, R>,
+        commitment: &WhirGrCommitment,
+        state: &WhirGrCommitmentState,
+        point: &[GrElem],
+    ) -> Result<GrElem>
+    where
+        H: DuplexSpongeInterface,
+        R: RngCore + CryptoRng,
+        WhirGrOpeningPayload: ProverMessage<[H::U]>,
+    {
+        let opening = self.open(commitment, state, point)?;
+        let value = opening.value.clone();
+        prover_state.prover_message(&WhirGrOpeningPayload::from_opening(
+            &self.public_params.ctx,
+            &opening,
+        ));
+        Ok(value)
+    }
 }
 
 fn prove_round(
@@ -181,7 +241,7 @@ fn prove_round(
     let next_polynomial = state.polynomial.restrict_prefix(ctx, &alphas)?;
     let next_domain = state.domain.pow_map(3)?;
     let next_oracle = encode_oracle(params, &next_domain, &next_polynomial)?;
-    let next_tree = build_oracle_tree(ctx, &next_oracle)?;
+    let next_tree = build_oracle_tree(params.hash_id, ctx, &next_oracle)?;
     round.g_root = next_tree.root();
     transcript.absorb_labeled_bytes(&indexed_label(b"whir.g_root", layer, None), &round.g_root.0);
 
@@ -463,8 +523,9 @@ mod tests {
         protocols::whir_gr::{
             common::WhirGrPublicParameters, constraint::ternary_grid,
             multiquadratic::MultiQuadraticPolynomial, prover::WhirGrProver,
-            verifier::WhirGrVerifier,
+            serialization::serialize_public_parameters, verifier::WhirGrVerifier,
         },
+        transcript::{codecs::Empty, DomainSeparator, ProverState, VerifierState},
     };
 
     fn context_for_domain_size(domain_size: u64) -> Arc<GrContext> {
@@ -568,5 +629,36 @@ mod tests {
             .ctx
             .add(&bad_final.proof.final_constant, &params.ctx.one());
         assert!(!verifier.verify(&commitment, &point, &bad_final).unwrap());
+    }
+
+    #[test]
+    fn transcript_wrapped_opening_should_verify() {
+        let params = public_parameters(2, 1);
+        let poly = polynomial(&params.ctx, 2);
+        let point = open_point(&params.ctx, 2);
+        let prover = WhirGrProver::new(&params);
+        let verifier = WhirGrVerifier::new(&params);
+        let instance = Empty;
+        let ds = DomainSeparator::protocol(&serialize_public_parameters(&params))
+            .session(&"whir-gr transcript wrapper")
+            .instance(&instance);
+
+        let mut prover_state = ProverState::new_std(&ds);
+        let (commitment, state) = prover.commit_transcript(&mut prover_state, &poly).unwrap();
+        let value = prover
+            .open_transcript(&mut prover_state, &commitment, &state, &point)
+            .unwrap();
+        let proof = prover_state.proof();
+
+        let mut verifier_state = VerifierState::new_std(&ds, &proof);
+        let received_commitment = verifier.receive_commitment(&mut verifier_state).unwrap();
+        let verified_value = verifier
+            .verify_transcript(&mut verifier_state, &received_commitment, &point)
+            .unwrap();
+        verifier_state.check_eof().unwrap();
+
+        assert_eq!(received_commitment, commitment);
+        assert_eq!(verified_value, value);
+        assert_eq!(verified_value, poly.evaluate(&params.ctx, &point).unwrap());
     }
 }
