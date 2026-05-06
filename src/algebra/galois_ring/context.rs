@@ -213,6 +213,14 @@ impl GrContext {
         }
     }
 
+    pub fn add_assign(&self, lhs: &mut GrElem, rhs: &GrElem) {
+        self.debug_assert_element(lhs);
+        self.debug_assert_element(rhs);
+        for (lhs, &rhs) in lhs.coefficients_mut().iter_mut().zip(rhs.coefficients()) {
+            *lhs = self.normalize(lhs.wrapping_add(rhs));
+        }
+    }
+
     pub fn sub(&self, lhs: &GrElem, rhs: &GrElem) -> GrElem {
         self.debug_assert_element(lhs);
         self.debug_assert_element(rhs);
@@ -602,6 +610,10 @@ mod tests {
 
         ctx.add_into(&mut out, &lhs, &rhs);
         assert_eq!(out, ctx.add(&lhs, &rhs));
+
+        let mut assigned = lhs.clone();
+        ctx.add_assign(&mut assigned, &rhs);
+        assert_eq!(assigned, ctx.add(&lhs, &rhs));
 
         ctx.sub_into(&mut out, &lhs, &rhs);
         assert_eq!(out, ctx.sub(&lhs, &rhs));

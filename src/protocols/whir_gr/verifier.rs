@@ -1,10 +1,15 @@
+use std::time::Instant;
+
 use crate::{
-    algebra::galois_ring::{Domain, GrElem, GrError, Result},
+    algebra::galois_ring::{Domain, GrContext, GrElem, GrError, Result},
     hash::Hash,
     protocols::whir_gr::{
         common::{WhirGrCommitment, WhirGrOpening, WhirGrPublicParameters, WhirGrRoundProof},
         constraint::{check_sumcheck_identity, sumcheck_next_sigma, WhirConstraint},
-        folding::{evaluate_repeated_ternary_fold_from_values, virtual_fold_query_indices},
+        folding::{
+            evaluate_ordered_repeated_ternary_fold_batch_from_values, virtual_fold_query_indices,
+            virtual_fold_query_points,
+        },
         merkle::{ByteMerkleTree, MerkleProof},
         multiquadratic::{pow3_checked, pow_m},
         prover::{
@@ -25,6 +30,16 @@ pub struct WhirGrVerifier<'a> {
     public_params: &'a WhirGrPublicParameters,
 }
 
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WhirGrVerifyTimings {
+    pub sumcheck_ms: f64,
+    pub merkle_ms: f64,
+    pub fold_ms: f64,
+    pub constraint_ms: f64,
+    pub final_ms: f64,
+}
+
 impl<'a> WhirGrVerifier<'a> {
     pub const fn new(public_params: &'a WhirGrPublicParameters) -> Self {
         Self { public_params }
@@ -36,8 +51,30 @@ impl<'a> WhirGrVerifier<'a> {
         point: &[GrElem],
         opening: &WhirGrOpening,
     ) -> Result<bool> {
+        let (accepted, _timings) = self.verify_impl(commitment, point, opening, false)?;
+        Ok(accepted)
+    }
+
+    #[doc(hidden)]
+    pub fn verify_profiled(
+        &self,
+        commitment: &WhirGrCommitment,
+        point: &[GrElem],
+        opening: &WhirGrOpening,
+    ) -> Result<(bool, WhirGrVerifyTimings)> {
+        self.verify_impl(commitment, point, opening, true)
+    }
+
+    fn verify_impl(
+        &self,
+        commitment: &WhirGrCommitment,
+        point: &[GrElem],
+        opening: &WhirGrOpening,
+        capture_timings: bool,
+    ) -> Result<(bool, WhirGrVerifyTimings)> {
+        let mut timings = WhirGrVerifyTimings::default();
         if !self.shape_valid(commitment, point, opening)? {
-            return Ok(false);
+            return Ok((false, timings));
         }
 
         let ctx = &self.public_params.ctx;
@@ -69,17 +106,21 @@ impl<'a> WhirGrVerifier<'a> {
                 &mut transcript,
                 &input,
                 &mut round_state,
+                &mut timings,
+                capture_timings,
             )?
             else {
-                return Ok(false);
+                return Ok((false, timings));
             };
             current_domain = next_state.domain;
             current_root = next_state.root;
             live_variables -= width;
         }
 
+        let final_start = capture_timings.then(Instant::now);
         if constraint.evaluate_w(ctx, &opening.proof.final_constant, &[])? != sigma {
-            return Ok(false);
+            record_elapsed(&mut timings.final_ms, final_start);
+            return Ok((false, timings));
         }
 
         transcript.absorb_ring_element(ctx, b"whir.final.constant", &opening.proof.final_constant);
@@ -91,22 +132,32 @@ impl<'a> WhirGrVerifier<'a> {
         if positions_to_sorted_usize(final_positions, current_domain.size())?
             != opening.proof.final_openings.queried_indices
         {
-            return Ok(false);
+            record_elapsed(&mut timings.final_ms, final_start);
+            return Ok((false, timings));
         }
+        record_elapsed(&mut timings.final_ms, final_start);
+
+        let merkle_start = capture_timings.then(Instant::now);
         if !ByteMerkleTree::verify(
             self.public_params.hash_id,
             current_root,
             &opening.proof.final_openings,
         )? {
-            return Ok(false);
+            record_elapsed(&mut timings.merkle_ms, merkle_start);
+            return Ok((false, timings));
         }
+        record_elapsed(&mut timings.merkle_ms, merkle_start);
+
+        let final_start = capture_timings.then(Instant::now);
         for payload in &opening.proof.final_openings.leaf_payloads {
             if ctx.deserialize(payload)? != opening.proof.final_constant {
-                return Ok(false);
+                record_elapsed(&mut timings.final_ms, final_start);
+                return Ok((false, timings));
             }
         }
+        record_elapsed(&mut timings.final_ms, final_start);
 
-        Ok(true)
+        Ok((true, timings))
     }
 
     pub fn receive_commitment<H>(
@@ -176,11 +227,18 @@ struct VerifierRoundState<'a> {
     sigma: &'a mut GrElem,
 }
 
+struct FoldQueryCheck {
+    shift_points: Vec<Vec<GrElem>>,
+    folded_values: Vec<GrElem>,
+}
+
 fn verify_round(
     params: &WhirGrPublicParameters,
     transcript: &mut Transcript,
     input: &VerifierRoundInput<'_>,
     state: &mut VerifierRoundState<'_>,
+    timings: &mut WhirGrVerifyTimings,
+    capture_timings: bool,
 ) -> Result<Option<NextVerifierState>> {
     if input.round.sumcheck_polynomials.len() != input.width as usize
         || input.width > input.live_variables
@@ -191,6 +249,7 @@ fn verify_round(
 
     let ctx = &params.ctx;
     let mut alphas = Vec::with_capacity(input.width as usize);
+    let sumcheck_start = capture_timings.then(Instant::now);
     for j in 0..input.width {
         let h = &input.round.sumcheck_polynomials[j as usize];
         transcript.absorb_labeled_bytes(
@@ -211,6 +270,7 @@ fn verify_round(
         *state.sigma = sumcheck_next_sigma(ctx, h, &alpha);
         alphas.push(alpha);
     }
+    record_elapsed(&mut timings.sumcheck_ms, sumcheck_start);
 
     transcript.absorb_labeled_bytes(
         &indexed_label(b"whir.g_root", input.layer, None),
@@ -235,36 +295,44 @@ fn verify_round(
     {
         return Ok(None);
     }
+    let merkle_start = capture_timings.then(Instant::now);
     if !ByteMerkleTree::verify(
         params.hash_id,
         input.current_root,
         &input.round.virtual_fold_openings,
     )? {
+        record_elapsed(&mut timings.merkle_ms, merkle_start);
         return Ok(None);
     }
+    record_elapsed(&mut timings.merkle_ms, merkle_start);
 
     let gamma =
         transcript.challenge_teichmuller(ctx, &indexed_label(b"whir.gamma", input.layer, None))?;
+    let constraint_start = capture_timings.then(Instant::now);
     let mut next_constraint = state.constraint.restrict_prefix(ctx, &alphas)?;
-    let shift_domain = input.current_domain.pow_map(fold_width)?;
-    let next_variable_count = input.live_variables - input.width;
+    record_elapsed(&mut timings.constraint_ms, constraint_start);
+
+    let fold_start = capture_timings.then(Instant::now);
+    let fold_queries = check_virtual_fold_queries(
+        input,
+        &shift_positions,
+        &parent_indices_by_shift,
+        &alphas,
+        fold_width,
+    )?;
+    record_elapsed(&mut timings.fold_ms, fold_start);
+
     let mut gamma_power = gamma.clone();
-    for (&shift_index, indices) in shift_positions.iter().zip(&parent_indices_by_shift) {
-        let payloads = payloads_for_indices(&input.round.virtual_fold_openings, indices)?;
-        let folded_value = evaluate_virtual_fold_query_from_payloads(
-            input.current_domain,
-            indices,
-            &payloads,
-            &alphas,
-        )?;
-        let shift_point = pow_m(
-            ctx,
-            &shift_domain.element(shift_index)?,
-            next_variable_count,
-        )?;
+    for (shift_point, folded_value) in fold_queries
+        .shift_points
+        .into_iter()
+        .zip(&fold_queries.folded_values)
+    {
+        let constraint_start = capture_timings.then(Instant::now);
         next_constraint.add_shift_term(gamma_power.clone(), shift_point)?;
-        *state.sigma = ctx.add(state.sigma, &ctx.mul(&gamma_power, &folded_value));
+        *state.sigma = ctx.add(state.sigma, &ctx.mul(&gamma_power, folded_value));
         gamma_power = ctx.mul(&gamma_power, &gamma);
+        record_elapsed(&mut timings.constraint_ms, constraint_start);
     }
 
     *state.constraint = next_constraint;
@@ -285,8 +353,55 @@ fn parent_indices_by_shift(
         .collect()
 }
 
-fn payloads_for_indices(proof: &MerkleProof, indices: &[u64]) -> Result<Vec<Vec<u8>>> {
-    let mut payloads = Vec::with_capacity(indices.len());
+fn check_virtual_fold_queries(
+    input: &VerifierRoundInput<'_>,
+    shift_positions: &[u64],
+    parent_indices_by_shift: &[Vec<u64>],
+    alphas: &[GrElem],
+    fold_width: u64,
+) -> Result<FoldQueryCheck> {
+    let ctx = input.current_domain.context();
+    let shift_domain = input.current_domain.pow_map(fold_width)?;
+    let next_variable_count = input.live_variables - input.width;
+    let mut query_points = Vec::with_capacity(shift_positions.len());
+    let mut query_values = Vec::with_capacity(shift_positions.len());
+    let mut shift_points = Vec::with_capacity(shift_positions.len());
+    for (&shift_index, indices) in shift_positions.iter().zip(parent_indices_by_shift) {
+        query_points.push(virtual_fold_query_points(
+            input.current_domain,
+            input.width,
+            shift_index,
+        )?);
+        query_values.push(values_for_indices(
+            ctx,
+            &input.round.virtual_fold_openings,
+            indices,
+        )?);
+        shift_points.push(pow_m(
+            ctx,
+            &shift_domain.element(shift_index)?,
+            next_variable_count,
+        )?);
+    }
+
+    let folded_values = evaluate_ordered_repeated_ternary_fold_batch_from_values(
+        ctx,
+        query_points,
+        query_values,
+        alphas,
+    )?;
+    Ok(FoldQueryCheck {
+        shift_points,
+        folded_values,
+    })
+}
+
+fn values_for_indices(
+    ctx: &GrContext,
+    proof: &MerkleProof,
+    indices: &[u64],
+) -> Result<Vec<GrElem>> {
+    let mut values = Vec::with_capacity(indices.len());
     for &index in indices {
         let index =
             usize::try_from(index).map_err(|_| GrError::ArithmeticOverflow("query index"))?;
@@ -294,31 +409,9 @@ fn payloads_for_indices(proof: &MerkleProof, indices: &[u64]) -> Result<Vec<Vec<
             .queried_indices
             .binary_search(&index)
             .map_err(|_| GrError::InvalidDomain("missing WHIR_GR Merkle payload for query"))?;
-        payloads.push(proof.leaf_payloads[position].clone());
+        values.push(ctx.deserialize(&proof.leaf_payloads[position])?);
     }
-    Ok(payloads)
-}
-
-fn evaluate_virtual_fold_query_from_payloads(
-    domain: &Domain,
-    parent_indices: &[u64],
-    payloads: &[Vec<u8>],
-    alphas: &[GrElem],
-) -> Result<GrElem> {
-    if payloads.len() != parent_indices.len() {
-        return Err(GrError::InvalidDomain(
-            "WHIR_GR virtual fold query requires one payload per parent index",
-        ));
-    }
-
-    let ctx = domain.context();
-    let mut points = Vec::with_capacity(parent_indices.len());
-    let mut values = Vec::with_capacity(parent_indices.len());
-    for (&index, payload) in parent_indices.iter().zip(payloads) {
-        points.push(domain.element(index)?);
-        values.push(ctx.deserialize(payload)?);
-    }
-    evaluate_repeated_ternary_fold_from_values(ctx, &points, &values, alphas)
+    Ok(values)
 }
 
 fn round_shape_valid(round: &WhirGrRoundProof) -> bool {
@@ -335,4 +428,10 @@ const fn merkle_shape_valid(proof: &MerkleProof) -> bool {
     proof.leaf_count != 0
         && !proof.queried_indices.is_empty()
         && proof.queried_indices.len() == proof.leaf_payloads.len()
+}
+
+fn record_elapsed(slot: &mut f64, start: Option<Instant>) {
+    if let Some(start) = start {
+        *slot += start.elapsed().as_secs_f64() * 1000.0;
+    }
 }

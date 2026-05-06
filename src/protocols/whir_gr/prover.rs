@@ -11,10 +11,12 @@ use crate::{
         common::{
             WhirGrCommitment, WhirGrOpening, WhirGrProof, WhirGrPublicParameters, WhirGrRoundProof,
         },
-        constraint::{honest_sumcheck_polynomial, sumcheck_next_sigma, WhirConstraint},
+        constraint::{
+            honest_sumcheck_polynomial_for_restricted, sumcheck_next_sigma, WhirConstraint,
+        },
         folding::{
-            evaluate_repeated_ternary_fold_from_values, repeated_ternary_fold_table,
-            virtual_fold_query_indices,
+            evaluate_ordered_repeated_ternary_fold_batch_from_values, repeated_ternary_fold_table,
+            virtual_fold_query_indices, virtual_fold_query_points,
         },
         merkle::{build_oracle_tree, ByteMerkleTree},
         multiquadratic::{
@@ -52,10 +54,18 @@ pub struct WhirGrOpenTimings {
     pub clone_ms: f64,
     pub init_ms: f64,
     pub sumcheck_ms: f64,
+    pub sumcheck_constraint_plan_ms: f64,
+    pub sumcheck_poly_restrict_ms: f64,
+    pub sumcheck_poly_eval_ms: f64,
+    pub sumcheck_accumulate_ms: f64,
+    pub sumcheck_interpolate_ms: f64,
     pub restrict_ms: f64,
     pub encode_oracle_ms: f64,
     pub merkle_ms: f64,
     pub fold_ms: f64,
+    pub fold_indices_ms: f64,
+    pub fold_eval_ms: f64,
+    pub fold_shift_points_ms: f64,
     pub merkle_open_ms: f64,
     pub constraint_ms: f64,
     pub final_ms: f64,
@@ -79,6 +89,16 @@ struct ShiftQueryData {
     parent_indices: Vec<u64>,
     shift_points: Vec<Vec<GrElem>>,
     shift_values: Vec<GrElem>,
+}
+
+struct ShiftQueryInput<'a> {
+    params: &'a WhirGrPublicParameters,
+    current_domain: &'a Domain,
+    current_oracle: &'a [GrElem],
+    next_polynomial: &'a MultiQuadraticPolynomial,
+    alphas: &'a [GrElem],
+    shift_positions: &'a [u64],
+    width: u64,
 }
 
 impl<'a> WhirGrProver<'a> {
@@ -350,9 +370,20 @@ fn prove_round(
     };
 
     let mut alphas = Vec::with_capacity(width as usize);
+    let mut sumcheck_polynomial = state.polynomial.clone();
     let sumcheck_start = capture_timings.then(Instant::now);
     for j in 0..width {
-        let h = honest_sumcheck_polynomial(ctx, state.polynomial, state.constraint, &alphas)?;
+        let (h, sumcheck_timings) = honest_sumcheck_polynomial_for_restricted(
+            ctx,
+            &sumcheck_polynomial,
+            state.constraint,
+            &alphas,
+            capture_timings,
+        )?;
+        timings.sumcheck_constraint_plan_ms += sumcheck_timings.constraint_plan;
+        timings.sumcheck_poly_eval_ms += sumcheck_timings.poly_eval;
+        timings.sumcheck_accumulate_ms += sumcheck_timings.accumulate;
+        timings.sumcheck_interpolate_ms += sumcheck_timings.interpolate;
         transcript.absorb_labeled_bytes(
             &indexed_label(b"whir.sumcheck.poly", layer, Some(j)),
             &serialize_sumcheck_polynomial(ctx, &h),
@@ -360,13 +391,18 @@ fn prove_round(
         let alpha =
             transcript.challenge_teichmuller(ctx, &indexed_label(b"whir.alpha", layer, Some(j)))?;
         *state.sigma = sumcheck_next_sigma(ctx, &h, &alpha);
+        let poly_restrict_start = capture_timings.then(Instant::now);
+        let next_sumcheck_polynomial =
+            sumcheck_polynomial.restrict_prefix(ctx, std::slice::from_ref(&alpha))?;
+        record_elapsed(&mut timings.sumcheck_poly_restrict_ms, poly_restrict_start);
         alphas.push(alpha);
+        sumcheck_polynomial = next_sumcheck_polynomial;
         round.sumcheck_polynomials.push(h);
     }
     record_elapsed(&mut timings.sumcheck_ms, sumcheck_start);
 
     let restrict_start = capture_timings.then(Instant::now);
-    let next_polynomial = state.polynomial.restrict_prefix(ctx, &alphas)?;
+    let next_polynomial = sumcheck_polynomial;
     let next_domain = state.domain.pow_map(3)?;
     record_elapsed(&mut timings.restrict_ms, restrict_start);
 
@@ -387,15 +423,16 @@ fn prove_round(
         params.shift_repetitions[layer as usize],
     )?;
     let fold_start = capture_timings.then(Instant::now);
-    let shift_data = shift_query_data(
+    let shift_input = ShiftQueryInput {
         params,
-        state.domain,
-        state.oracle,
-        &next_polynomial,
-        &alphas,
-        &shift_positions,
+        current_domain: state.domain,
+        current_oracle: state.oracle,
+        next_polynomial: &next_polynomial,
+        alphas: &alphas,
+        shift_positions: &shift_positions,
         width,
-    )?;
+    };
+    let shift_data = shift_query_data(&shift_input, timings, capture_timings)?;
     record_elapsed(&mut timings.fold_ms, fold_start);
 
     let merkle_open_start = capture_timings.then(Instant::now);
@@ -426,47 +463,83 @@ fn prove_round(
 }
 
 fn shift_query_data(
-    params: &WhirGrPublicParameters,
-    current_domain: &Domain,
-    current_oracle: &[GrElem],
-    next_polynomial: &MultiQuadraticPolynomial,
-    alphas: &[GrElem],
-    shift_positions: &[u64],
-    width: u64,
+    input: &ShiftQueryInput<'_>,
+    timings: &mut WhirGrOpenTimings,
+    capture_timings: bool,
 ) -> Result<ShiftQueryData> {
-    let ctx = &params.ctx;
-    let fold_width = pow3_checked(width)?;
-    let shift_domain = current_domain.pow_map(fold_width)?;
+    let ctx = &input.params.ctx;
+    if input.current_oracle.len()
+        != checked_usize(input.current_domain.size(), "current oracle size")?
+    {
+        return Err(GrError::InvalidDomain(
+            "WHIR virtual fold query requires oracle size == domain size",
+        ));
+    }
+
+    let fold_width = pow3_checked(input.width)?;
+    let shift_domain = input.current_domain.pow_map(fold_width)?;
     let dense_shift_queries =
-        shift_positions.len() as u64 >= current_domain.size() / fold_width / 2;
+        input.shift_positions.len() as u64 >= input.current_domain.size() / fold_width / 2;
+    let fold_eval_start = capture_timings.then(Instant::now);
     let folded_for_queries = if dense_shift_queries {
-        repeated_ternary_fold_table(current_domain, current_oracle, alphas)?
+        repeated_ternary_fold_table(input.current_domain, input.current_oracle, input.alphas)?
     } else {
         Vec::new()
     };
+    record_elapsed(&mut timings.fold_eval_ms, fold_eval_start);
 
     let mut parent_indices = Vec::new();
-    let mut shift_points = Vec::with_capacity(shift_positions.len());
-    let mut shift_values = Vec::with_capacity(shift_positions.len());
-    for &shift_index in shift_positions {
-        let indices = virtual_fold_query_indices(current_domain.size(), width, shift_index)?;
+    let mut shift_points = Vec::with_capacity(input.shift_positions.len());
+    let mut shift_values = if dense_shift_queries {
+        Vec::with_capacity(input.shift_positions.len())
+    } else {
+        Vec::new()
+    };
+    let mut sparse_points = Vec::new();
+    let mut sparse_values = Vec::new();
+    for &shift_index in input.shift_positions {
+        let indices_start = capture_timings.then(Instant::now);
+        let indices =
+            virtual_fold_query_indices(input.current_domain.size(), input.width, shift_index)?;
         parent_indices.extend_from_slice(&indices);
-        let value = if dense_shift_queries {
-            folded_for_queries[shift_index as usize].clone()
+        record_elapsed(&mut timings.fold_indices_ms, indices_start);
+
+        let fold_eval_start = capture_timings.then(Instant::now);
+        if dense_shift_queries {
+            shift_values.push(folded_for_queries[shift_index as usize].clone());
         } else {
-            evaluate_virtual_fold_query_from_oracle(
-                current_domain,
-                current_oracle,
-                &indices,
-                alphas,
-            )?
-        };
-        shift_values.push(value);
+            sparse_points.push(virtual_fold_query_points(
+                input.current_domain,
+                input.width,
+                shift_index,
+            )?);
+            sparse_values.push(
+                indices
+                    .iter()
+                    .map(|&index| input.current_oracle[index as usize].clone())
+                    .collect::<Vec<_>>(),
+            );
+        }
+        record_elapsed(&mut timings.fold_eval_ms, fold_eval_start);
+
+        let shift_point_start = capture_timings.then(Instant::now);
         shift_points.push(pow_m(
             ctx,
             &shift_domain.element(shift_index)?,
-            next_polynomial.variable_count(),
+            input.next_polynomial.variable_count(),
         )?);
+        record_elapsed(&mut timings.fold_shift_points_ms, shift_point_start);
+    }
+
+    if !dense_shift_queries {
+        let fold_eval_start = capture_timings.then(Instant::now);
+        shift_values = evaluate_ordered_repeated_ternary_fold_batch_from_values(
+            ctx,
+            sparse_points,
+            sparse_values,
+            input.alphas,
+        )?;
+        record_elapsed(&mut timings.fold_eval_ms, fold_eval_start);
     }
 
     Ok(ShiftQueryData {
@@ -474,27 +547,6 @@ fn shift_query_data(
         shift_points,
         shift_values,
     })
-}
-
-fn evaluate_virtual_fold_query_from_oracle(
-    domain: &Domain,
-    oracle: &[GrElem],
-    indices: &[u64],
-    alphas: &[GrElem],
-) -> Result<GrElem> {
-    if oracle.len() != domain.size() as usize {
-        return Err(GrError::InvalidDomain(
-            "WHIR virtual fold query requires oracle size == domain size",
-        ));
-    }
-
-    let mut points = Vec::with_capacity(indices.len());
-    let mut values = Vec::with_capacity(indices.len());
-    for &index in indices {
-        points.push(domain.element(index)?);
-        values.push(oracle[index as usize].clone());
-    }
-    evaluate_repeated_ternary_fold_from_values(domain.context(), &points, &values, alphas)
 }
 
 pub(crate) fn encode_oracle(
@@ -505,8 +557,63 @@ pub(crate) fn encode_oracle(
     if domain.context().config() != params.ctx.config() {
         return Err(GrError::DifferentRings);
     }
+    #[cfg(feature = "parallel")]
+    {
+        if domain.size() >= PARALLEL_ORACLE_THRESHOLD && rayon::current_num_threads() > 1 {
+            return encode_oracle_parallel(params, domain, polynomial);
+        }
+    }
+    encode_oracle_sequential(params, domain, polynomial)
+}
+
+fn encode_oracle_sequential(
+    params: &WhirGrPublicParameters,
+    domain: &Domain,
+    polynomial: &MultiQuadraticPolynomial,
+) -> Result<Vec<GrElem>> {
+    let size = checked_usize(domain.size(), "domain size")?;
+    encode_oracle_chunk(params, domain, polynomial, 0, size)
+}
+
+#[cfg(feature = "parallel")]
+fn encode_oracle_parallel(
+    params: &WhirGrPublicParameters,
+    domain: &Domain,
+    polynomial: &MultiQuadraticPolynomial,
+) -> Result<Vec<GrElem>> {
+    let size = checked_usize(domain.size(), "domain size")?;
+    if size == 0 {
+        return Ok(Vec::new());
+    }
+
+    let target_chunks = rayon::current_num_threads().saturating_mul(4).max(1);
+    let chunk_size = size.div_ceil(target_chunks).max(1);
+    let starts = (0..size).step_by(chunk_size).collect::<Vec<_>>();
+    let chunks = starts
+        .par_iter()
+        .map(|&begin| {
+            let len = chunk_size.min(size - begin);
+            encode_oracle_chunk(params, domain, polynomial, begin, len)
+        })
+        .collect::<Vec<_>>();
+
     let mut oracle = Vec::with_capacity(checked_usize(domain.size(), "domain size")?);
-    for point in domain.iter_elements() {
+    for chunk in chunks {
+        oracle.extend(chunk?);
+    }
+    Ok(oracle)
+}
+
+fn encode_oracle_chunk(
+    params: &WhirGrPublicParameters,
+    domain: &Domain,
+    polynomial: &MultiQuadraticPolynomial,
+    begin: usize,
+    len: usize,
+) -> Result<Vec<GrElem>> {
+    let mut oracle = Vec::with_capacity(len);
+    let begin = u64::try_from(begin).map_err(|_| GrError::ArithmeticOverflow("chunk begin"))?;
+    for point in domain.iter_elements_from(begin)?.take(len) {
         oracle.push(polynomial.evaluate_pow(&params.ctx, &point));
     }
     Ok(oracle)
