@@ -1,7 +1,11 @@
+use std::time::Instant;
+
 use ark_std::rand::{CryptoRng, RngCore};
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 
 use crate::{
-    algebra::galois_ring::{Domain, GrElem, GrError, Result},
+    algebra::galois_ring::{Domain, GrContext, GrElem, GrError, Result},
     hash::Hash,
     protocols::whir_gr::{
         common::{
@@ -13,7 +17,9 @@ use crate::{
             virtual_fold_query_indices,
         },
         merkle::{build_oracle_tree, ByteMerkleTree},
-        multiquadratic::{pow3_checked, pow_m, MultiQuadraticPolynomial, MultilinearPolynomial},
+        multiquadratic::{
+            pow2_checked, pow3_checked, pow_m, MultiQuadraticPolynomial, MultilinearPolynomial,
+        },
         serialization::{
             serialize_public_parameters, serialize_ring_vector, serialize_sumcheck_polynomial,
             WhirGrOpeningPayload,
@@ -30,6 +36,29 @@ pub struct WhirGrCommitmentState {
     initial_tree: ByteMerkleTree,
     initial_oracle: Vec<GrElem>,
     oracle_root: Hash,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WhirGrCommitTimings {
+    pub encode_oracle_ms: f64,
+    pub merkle_ms: f64,
+    pub to_multiquadratic_ms: f64,
+}
+
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WhirGrOpenTimings {
+    pub clone_ms: f64,
+    pub init_ms: f64,
+    pub sumcheck_ms: f64,
+    pub restrict_ms: f64,
+    pub encode_oracle_ms: f64,
+    pub merkle_ms: f64,
+    pub fold_ms: f64,
+    pub merkle_open_ms: f64,
+    pub constraint_ms: f64,
+    pub final_ms: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -109,7 +138,60 @@ impl<'a> WhirGrProver<'a> {
         &self,
         polynomial: &MultilinearPolynomial,
     ) -> Result<(WhirGrCommitment, WhirGrCommitmentState)> {
-        self.commit(&polynomial.to_multi_quadratic(&self.public_params.ctx)?)
+        let (commitment, state, _timings) = self.commit_multilinear_impl(polynomial, false)?;
+        Ok((commitment, state))
+    }
+
+    #[doc(hidden)]
+    pub fn commit_multilinear_profiled(
+        &self,
+        polynomial: &MultilinearPolynomial,
+    ) -> Result<(WhirGrCommitment, WhirGrCommitmentState, WhirGrCommitTimings)> {
+        self.commit_multilinear_impl(polynomial, true)
+    }
+
+    fn commit_multilinear_impl(
+        &self,
+        polynomial: &MultilinearPolynomial,
+        capture_timings: bool,
+    ) -> Result<(WhirGrCommitment, WhirGrCommitmentState, WhirGrCommitTimings)> {
+        validate_public_parameters(self.public_params)?;
+        if polynomial.variable_count() != self.public_params.variable_count {
+            return Err(GrError::InvalidPolynomial(
+                "WHIR_GR commit polynomial variable count mismatch",
+            ));
+        }
+
+        let mut timings = WhirGrCommitTimings::default();
+        let encode_start = capture_timings.then(Instant::now);
+        let initial_oracle = encode_multilinear_oracle(
+            self.public_params,
+            &self.public_params.initial_domain,
+            polynomial,
+        )?;
+        record_elapsed(&mut timings.encode_oracle_ms, encode_start);
+
+        let merkle_start = capture_timings.then(Instant::now);
+        let initial_tree = build_oracle_tree(
+            self.public_params.hash_id,
+            &self.public_params.ctx,
+            &initial_oracle,
+        )?;
+        record_elapsed(&mut timings.merkle_ms, merkle_start);
+        let oracle_root = initial_tree.root();
+        let commitment = WhirGrCommitment { oracle_root };
+
+        let dense_start = capture_timings.then(Instant::now);
+        let polynomial = polynomial.to_multi_quadratic(&self.public_params.ctx)?;
+        record_elapsed(&mut timings.to_multiquadratic_ms, dense_start);
+        let state = WhirGrCommitmentState {
+            public_params: self.public_params.clone(),
+            polynomial,
+            initial_tree,
+            initial_oracle,
+            oracle_root,
+        };
+        Ok((commitment, state, timings))
     }
 
     pub fn commit_multilinear_transcript<H, R>(
@@ -134,27 +216,58 @@ impl<'a> WhirGrProver<'a> {
         state: &WhirGrCommitmentState,
         point: &[GrElem],
     ) -> Result<WhirGrOpening> {
+        let (opening, _timings) = self.open_impl(commitment, state, point, false)?;
+        Ok(opening)
+    }
+
+    #[doc(hidden)]
+    pub fn open_profiled(
+        &self,
+        commitment: &WhirGrCommitment,
+        state: &WhirGrCommitmentState,
+        point: &[GrElem],
+    ) -> Result<(WhirGrOpening, WhirGrOpenTimings)> {
+        self.open_impl(commitment, state, point, true)
+    }
+
+    fn open_impl(
+        &self,
+        commitment: &WhirGrCommitment,
+        state: &WhirGrCommitmentState,
+        point: &[GrElem],
+        capture_timings: bool,
+    ) -> Result<(WhirGrOpening, WhirGrOpenTimings)> {
         validate_open_inputs(self.public_params, commitment, state, point)?;
 
+        let mut timings = WhirGrOpenTimings::default();
         let ctx = &self.public_params.ctx;
+        let clone_start = capture_timings.then(Instant::now);
         let mut current_polynomial = state.polynomial.clone();
         let mut current_domain = self.public_params.initial_domain.clone();
         let mut current_oracle = state.initial_oracle.clone();
         let mut current_tree = state.initial_tree.clone();
+        record_elapsed(&mut timings.clone_ms, clone_start);
+
+        let init_start = capture_timings.then(Instant::now);
         let mut constraint = WhirConstraint::new(self.public_params.ternary_grid.clone());
         constraint.add_shift_term(ctx.one(), point.to_vec())?;
         let mut sigma = current_polynomial.evaluate(ctx, point)?;
+        let mut transcript = opening_transcript(self.public_params, commitment, point, &sigma);
+        record_elapsed(&mut timings.init_ms, init_start);
+
+        let merkle_open_start = capture_timings.then(Instant::now);
+        let final_openings = current_tree.open(&[0])?;
+        record_elapsed(&mut timings.merkle_open_ms, merkle_open_start);
 
         let mut opening = WhirGrOpening {
             value: sigma.clone(),
             proof: WhirGrProof {
                 rounds: Vec::with_capacity(self.public_params.layer_widths.len()),
                 final_constant: ctx.zero(),
-                final_openings: current_tree.open(&[0])?,
+                final_openings,
             },
         };
 
-        let mut transcript = opening_transcript(self.public_params, commitment, point, &sigma);
         for (layer, &width) in self.public_params.layer_widths.iter().enumerate() {
             let mut round_state = ProverRoundState {
                 polynomial: &mut current_polynomial,
@@ -170,10 +283,13 @@ impl<'a> WhirGrProver<'a> {
                 layer as u64,
                 width,
                 &mut round_state,
+                &mut timings,
+                capture_timings,
             )?;
             opening.proof.rounds.push(round);
         }
 
+        let final_start = capture_timings.then(Instant::now);
         opening.proof.final_constant = current_polynomial.evaluate(ctx, &[])?;
         transcript.absorb_ring_element(ctx, b"whir.final.constant", &opening.proof.final_constant);
         let final_positions = transcript.derive_unique_positions(
@@ -181,11 +297,15 @@ impl<'a> WhirGrProver<'a> {
             current_domain.size(),
             self.public_params.final_repetitions,
         )?;
+        record_elapsed(&mut timings.final_ms, final_start);
+
+        let merkle_open_start = capture_timings.then(Instant::now);
         opening.proof.final_openings = current_tree.open(&positions_to_sorted_usize(
             final_positions,
             current_domain.size(),
         )?)?;
-        Ok(opening)
+        record_elapsed(&mut timings.merkle_open_ms, merkle_open_start);
+        Ok((opening, timings))
     }
 
     pub fn open_transcript<H, R>(
@@ -216,15 +336,21 @@ fn prove_round(
     layer: u64,
     width: u64,
     state: &mut ProverRoundState<'_>,
+    timings: &mut WhirGrOpenTimings,
+    capture_timings: bool,
 ) -> Result<WhirGrRoundProof> {
     let ctx = &params.ctx;
+    let merkle_open_start = capture_timings.then(Instant::now);
+    let virtual_fold_openings = state.tree.open(&[0])?;
+    record_elapsed(&mut timings.merkle_open_ms, merkle_open_start);
     let mut round = WhirGrRoundProof {
         sumcheck_polynomials: Vec::with_capacity(width as usize),
         g_root: Hash::default(),
-        virtual_fold_openings: state.tree.open(&[0])?,
+        virtual_fold_openings,
     };
 
     let mut alphas = Vec::with_capacity(width as usize);
+    let sumcheck_start = capture_timings.then(Instant::now);
     for j in 0..width {
         let h = honest_sumcheck_polynomial(ctx, state.polynomial, state.constraint, &alphas)?;
         transcript.absorb_labeled_bytes(
@@ -237,11 +363,20 @@ fn prove_round(
         alphas.push(alpha);
         round.sumcheck_polynomials.push(h);
     }
+    record_elapsed(&mut timings.sumcheck_ms, sumcheck_start);
 
+    let restrict_start = capture_timings.then(Instant::now);
     let next_polynomial = state.polynomial.restrict_prefix(ctx, &alphas)?;
     let next_domain = state.domain.pow_map(3)?;
+    record_elapsed(&mut timings.restrict_ms, restrict_start);
+
+    let encode_start = capture_timings.then(Instant::now);
     let next_oracle = encode_oracle(params, &next_domain, &next_polynomial)?;
+    record_elapsed(&mut timings.encode_oracle_ms, encode_start);
+
+    let merkle_start = capture_timings.then(Instant::now);
     let next_tree = build_oracle_tree(params.hash_id, ctx, &next_oracle)?;
+    record_elapsed(&mut timings.merkle_ms, merkle_start);
     round.g_root = next_tree.root();
     transcript.absorb_labeled_bytes(&indexed_label(b"whir.g_root", layer, None), &round.g_root.0);
 
@@ -251,6 +386,7 @@ fn prove_round(
         shift_domain_size,
         params.shift_repetitions[layer as usize],
     )?;
+    let fold_start = capture_timings.then(Instant::now);
     let shift_data = shift_query_data(
         params,
         state.domain,
@@ -260,11 +396,16 @@ fn prove_round(
         &shift_positions,
         width,
     )?;
+    record_elapsed(&mut timings.fold_ms, fold_start);
+
+    let merkle_open_start = capture_timings.then(Instant::now);
     round.virtual_fold_openings = state.tree.open(&positions_to_sorted_usize(
         shift_data.parent_indices,
         state.domain.size(),
     )?)?;
+    record_elapsed(&mut timings.merkle_open_ms, merkle_open_start);
 
+    let constraint_start = capture_timings.then(Instant::now);
     let gamma =
         transcript.challenge_teichmuller(ctx, &indexed_label(b"whir.gamma", layer, None))?;
     let mut next_constraint = state.constraint.restrict_prefix(ctx, &alphas)?;
@@ -274,6 +415,7 @@ fn prove_round(
         *state.sigma = ctx.add(state.sigma, &ctx.mul(&gamma_power, value));
         gamma_power = ctx.mul(&gamma_power, &gamma);
     }
+    record_elapsed(&mut timings.constraint_ms, constraint_start);
 
     *state.polynomial = next_polynomial;
     *state.domain = next_domain;
@@ -363,9 +505,213 @@ pub(crate) fn encode_oracle(
     if domain.context().config() != params.ctx.config() {
         return Err(GrError::DifferentRings);
     }
-    (0..domain.size())
-        .map(|index| Ok(polynomial.evaluate_pow(&params.ctx, &domain.element(index)?)))
-        .collect()
+    let mut oracle = Vec::with_capacity(checked_usize(domain.size(), "domain size")?);
+    for point in domain.iter_elements() {
+        oracle.push(polynomial.evaluate_pow(&params.ctx, &point));
+    }
+    Ok(oracle)
+}
+
+pub(crate) fn encode_multilinear_oracle(
+    params: &WhirGrPublicParameters,
+    domain: &Domain,
+    polynomial: &MultilinearPolynomial,
+) -> Result<Vec<GrElem>> {
+    if domain.context().config() != params.ctx.config() {
+        return Err(GrError::DifferentRings);
+    }
+    #[cfg(feature = "parallel")]
+    {
+        if domain.size() >= PARALLEL_ORACLE_THRESHOLD && rayon::current_num_threads() > 1 {
+            return encode_multilinear_oracle_parallel(params, domain, polynomial);
+        }
+    }
+    encode_multilinear_oracle_sequential(params, domain, polynomial)
+}
+
+const PARALLEL_ORACLE_THRESHOLD: u64 = 1024;
+
+pub(crate) fn encode_multilinear_oracle_sequential(
+    params: &WhirGrPublicParameters,
+    domain: &Domain,
+    polynomial: &MultilinearPolynomial,
+) -> Result<Vec<GrElem>> {
+    let size = checked_usize(domain.size(), "domain size")?;
+    encode_multilinear_oracle_chunk(params, domain, polynomial, 0, size)
+}
+
+#[cfg(feature = "parallel")]
+pub(crate) fn encode_multilinear_oracle_parallel(
+    params: &WhirGrPublicParameters,
+    domain: &Domain,
+    polynomial: &MultilinearPolynomial,
+) -> Result<Vec<GrElem>> {
+    let size = checked_usize(domain.size(), "domain size")?;
+    if size == 0 {
+        return Ok(Vec::new());
+    }
+
+    let target_chunks = rayon::current_num_threads().saturating_mul(4).max(1);
+    let chunk_size = size.div_ceil(target_chunks).max(1);
+    let starts = (0..size).step_by(chunk_size).collect::<Vec<_>>();
+    let chunks = starts
+        .par_iter()
+        .map(|&begin| {
+            let len = chunk_size.min(size - begin);
+            encode_multilinear_oracle_chunk(params, domain, polynomial, begin, len)
+        })
+        .collect::<Vec<_>>();
+
+    let mut oracle = Vec::with_capacity(size);
+    for chunk in chunks {
+        oracle.extend(chunk?);
+    }
+    Ok(oracle)
+}
+
+fn encode_multilinear_oracle_chunk(
+    params: &WhirGrPublicParameters,
+    domain: &Domain,
+    polynomial: &MultilinearPolynomial,
+    begin: usize,
+    len: usize,
+) -> Result<Vec<GrElem>> {
+    let mut oracle = Vec::with_capacity(len);
+    let mut point_powers = Vec::with_capacity(checked_usize(
+        polynomial.variable_count(),
+        "variable count",
+    )?);
+    let mut evaluation_scratch = Vec::with_capacity(checked_usize(
+        pow2_checked(polynomial.variable_count())?,
+        "multilinear coefficient count",
+    )?);
+    let mut pow_square = params.ctx.zero();
+    let mut pow_product = params.ctx.zero();
+    let mut pow_scratch = vec![0; params.ctx.mul_scratch_len()];
+    let mut scaled_high = params.ctx.zero();
+    let mut next_value = params.ctx.zero();
+    let mut eval_mul_scratch = vec![0; params.ctx.mul_scratch_len()];
+    let begin = u64::try_from(begin).map_err(|_| GrError::ArithmeticOverflow("chunk begin"))?;
+    for point in domain.iter_elements_from(begin)?.take(len) {
+        pow_m_into(
+            &params.ctx,
+            &point,
+            polynomial.variable_count(),
+            &mut point_powers,
+            &mut pow_square,
+            &mut pow_product,
+            &mut pow_scratch,
+        )?;
+        oracle.push(evaluate_multilinear_folded(
+            &params.ctx,
+            polynomial,
+            &point_powers,
+            &mut evaluation_scratch,
+            &mut scaled_high,
+            &mut next_value,
+            &mut eval_mul_scratch,
+        )?);
+    }
+    Ok(oracle)
+}
+
+fn pow_m_into(
+    ctx: &GrContext,
+    x: &GrElem,
+    variable_count: u64,
+    out: &mut Vec<GrElem>,
+    square: &mut GrElem,
+    product: &mut GrElem,
+    scratch: &mut [u64],
+) -> Result<()> {
+    out.clear();
+    out.reserve(checked_usize(variable_count, "variable count")?);
+    let mut current = x.clone();
+    for _ in 0..variable_count {
+        out.push(current.clone());
+        ctx.square_into(square, &current, scratch);
+        ctx.mul_into(product, square, &current, scratch);
+        std::mem::swap(&mut current, product);
+    }
+    Ok(())
+}
+
+fn evaluate_multilinear_folded(
+    ctx: &GrContext,
+    polynomial: &MultilinearPolynomial,
+    point: &[GrElem],
+    scratch: &mut Vec<GrElem>,
+    scaled_high: &mut GrElem,
+    next_value: &mut GrElem,
+    mul_scratch: &mut [u64],
+) -> Result<GrElem> {
+    let variable_count = checked_usize(polynomial.variable_count(), "variable count")?;
+    if point.len() != variable_count {
+        return Err(GrError::InvalidPolynomial(
+            "multilinear point length mismatch",
+        ));
+    }
+
+    let coefficient_count = checked_usize(
+        pow2_checked(polynomial.variable_count())?,
+        "multilinear coefficient count",
+    )?;
+    if scratch.len() < coefficient_count {
+        scratch.resize_with(coefficient_count, || ctx.zero());
+    }
+    for (target, coefficient) in scratch.iter_mut().zip(polynomial.coefficients()) {
+        target.clone_from(coefficient);
+    }
+    let zero = ctx.zero();
+    for target in scratch
+        .iter_mut()
+        .take(coefficient_count)
+        .skip(polynomial.coefficients().len())
+    {
+        target.clone_from(&zero);
+    }
+
+    let mut active_len = coefficient_count;
+    for coordinate in point {
+        let next_len = active_len / 2;
+        for index in 0..next_len {
+            let low_index = 2 * index;
+            let high_index = low_index + 1;
+            if let Some(scalar) = base_scalar(&scratch[high_index]) {
+                ctx.mul_base_scalar_into(scaled_high, coordinate, scalar);
+            } else {
+                ctx.mul_into(scaled_high, &scratch[high_index], coordinate, mul_scratch);
+            }
+            ctx.add_into(next_value, &scratch[low_index], scaled_high);
+            std::mem::swap(&mut scratch[index], next_value);
+        }
+        active_len = next_len;
+    }
+
+    Ok(scratch.first().cloned().unwrap_or_else(|| ctx.zero()))
+}
+
+fn base_scalar(value: &GrElem) -> Option<u64> {
+    let coefficients = value.coefficients();
+    if coefficients
+        .iter()
+        .skip(1)
+        .any(|&coefficient| coefficient != 0)
+    {
+        None
+    } else {
+        coefficients.first().copied()
+    }
+}
+
+fn checked_usize(value: u64, label: &'static str) -> Result<usize> {
+    usize::try_from(value).map_err(|_| GrError::ArithmeticOverflow(label))
+}
+
+fn record_elapsed(slot: &mut f64, start: Option<Instant>) {
+    if let Some(start) = start {
+        *slot += start.elapsed().as_secs_f64() * 1000.0;
+    }
 }
 
 pub(crate) fn opening_transcript(
@@ -518,12 +864,21 @@ fn validate_open_inputs(
 mod tests {
     use std::sync::Arc;
 
+    #[cfg(feature = "parallel")]
+    use crate::protocols::whir_gr::prover::encode_multilinear_oracle_parallel;
     use crate::{
         algebra::galois_ring::{Domain, GrConfig, GrContext, GrElem},
         protocols::whir_gr::{
-            common::WhirGrPublicParameters, constraint::ternary_grid,
-            multiquadratic::MultiQuadraticPolynomial, prover::WhirGrProver,
-            serialization::serialize_public_parameters, verifier::WhirGrVerifier,
+            bench_support,
+            common::WhirGrPublicParameters,
+            constraint::ternary_grid,
+            multiquadratic::{pow2_checked, MultiQuadraticPolynomial, MultilinearPolynomial},
+            prover::{
+                encode_multilinear_oracle, encode_multilinear_oracle_sequential, encode_oracle,
+                WhirGrProver,
+            },
+            serialization::serialize_public_parameters,
+            verifier::WhirGrVerifier,
         },
         transcript::{codecs::Empty, DomainSeparator, ProverState, VerifierState},
     };
@@ -574,6 +929,18 @@ mod tests {
         MultiQuadraticPolynomial::new(variable_count, coefficients).unwrap()
     }
 
+    fn multilinear_polynomial(
+        ctx: &GrContext,
+        variable_count: u64,
+        seed: u64,
+    ) -> MultilinearPolynomial {
+        let coefficient_count = pow2_checked(variable_count).unwrap();
+        let coefficients = (0..coefficient_count)
+            .map(|index| ctx.from_u64((seed.wrapping_add(13 * index).wrapping_add(7)) % 29))
+            .collect();
+        MultilinearPolynomial::new(variable_count, coefficients).unwrap()
+    }
+
     fn open_point(ctx: &GrContext, variable_count: u64) -> Vec<GrElem> {
         (0..variable_count)
             .map(|index| ctx.from_u64(7 + 3 * index))
@@ -604,6 +971,77 @@ mod tests {
         run_roundtrip(2, 1);
         run_roundtrip(3, 1);
         run_roundtrip(2, 2);
+    }
+
+    #[test]
+    fn profiled_opening_should_match_plain_opening() {
+        let params = public_parameters(3, 1);
+        let poly = polynomial(&params.ctx, 3);
+        let point = open_point(&params.ctx, 3);
+        let prover = WhirGrProver::new(&params);
+        let (commitment, state) = prover.commit(&poly).unwrap();
+
+        let plain_opening = prover.open(&commitment, &state, &point).unwrap();
+        let (profiled_opening, _timings) =
+            prover.open_profiled(&commitment, &state, &point).unwrap();
+
+        assert_eq!(profiled_opening, plain_opening);
+    }
+
+    #[test]
+    fn multilinear_oracle_encoding_should_match_dense_embedding() {
+        for variable_count in 1..=3 {
+            let params = public_parameters(variable_count, 1);
+            for seed in [0, 19] {
+                let multilinear = multilinear_polynomial(&params.ctx, variable_count, seed);
+                let embedded = multilinear.to_multi_quadratic(&params.ctx).unwrap();
+                assert_eq!(
+                    encode_multilinear_oracle(&params, &params.initial_domain, &multilinear)
+                        .unwrap(),
+                    encode_oracle(&params, &params.initial_domain, &embedded).unwrap()
+                );
+                let prover = WhirGrProver::new(&params);
+                assert_eq!(
+                    prover.commit_multilinear(&multilinear).unwrap().0,
+                    prover.commit(&embedded).unwrap().0
+                );
+            }
+        }
+
+        let case = bench_support::find_case("m4").unwrap();
+        let params = bench_support::build_params(case).unwrap();
+        for seed in [0, 19] {
+            let multilinear =
+                bench_support::multilinear_polynomial(&params.ctx, case.variable_count, seed)
+                    .unwrap();
+            let embedded = multilinear.to_multi_quadratic(&params.ctx).unwrap();
+            assert_eq!(
+                encode_multilinear_oracle(&params, &params.initial_domain, &multilinear).unwrap(),
+                encode_oracle(&params, &params.initial_domain, &embedded).unwrap()
+            );
+            let prover = WhirGrProver::new(&params);
+            assert_eq!(
+                prover.commit_multilinear(&multilinear).unwrap().0,
+                prover.commit(&embedded).unwrap().0
+            );
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_multilinear_oracle_encoding_should_match_sequential() {
+        let case = bench_support::find_case("m6").unwrap();
+        let params = bench_support::build_params(case).unwrap();
+        let multilinear =
+            bench_support::multilinear_polynomial(&params.ctx, case.variable_count, 23).unwrap();
+        let sequential =
+            encode_multilinear_oracle_sequential(&params, &params.initial_domain, &multilinear)
+                .unwrap();
+        let parallel =
+            encode_multilinear_oracle_parallel(&params, &params.initial_domain, &multilinear)
+                .unwrap();
+
+        assert_eq!(parallel, sequential);
     }
 
     #[test]

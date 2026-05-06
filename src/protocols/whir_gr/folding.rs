@@ -14,6 +14,9 @@ pub fn fold_eval(
             "fold_eval requires equal-sized fiber inputs",
         ));
     }
+    if fiber_points.len() == 3 {
+        return fold_eval_ternary(ctx, fiber_points, fiber_values, alpha);
+    }
 
     let mut denominator_products = Vec::with_capacity(fiber_points.len());
     for (index, point) in fiber_points.iter().enumerate() {
@@ -56,6 +59,49 @@ pub fn fold_eval(
     for index in 0..fiber_points.len() {
         let numerator = ctx.mul(&prefix_products[index], &suffix_products[index + 1]);
         let basis_value = ctx.mul(&numerator, &denominator_inverses[index]);
+        out = ctx.add(&out, &ctx.mul(&fiber_values[index], &basis_value));
+    }
+    Ok(out)
+}
+
+fn fold_eval_ternary(
+    ctx: &GrContext,
+    fiber_points: &[GrElem],
+    fiber_values: &[GrElem],
+    alpha: &GrElem,
+) -> Result<GrElem> {
+    let p0 = &fiber_points[0];
+    let p1 = &fiber_points[1];
+    let p2 = &fiber_points[2];
+    let d01 = ctx.sub(p0, p1);
+    let d02 = ctx.sub(p0, p2);
+    let d10 = ctx.sub(p1, p0);
+    let d12 = ctx.sub(p1, p2);
+    let d20 = ctx.sub(p2, p0);
+    let d21 = ctx.sub(p2, p1);
+    if [&d01, &d02, &d10, &d12, &d20, &d21]
+        .iter()
+        .any(|difference| !ctx.is_unit(difference))
+    {
+        return Err(GrError::InvalidDomain(
+            "fold_eval requires fiber points with unit differences",
+        ));
+    }
+
+    let denominators = [
+        ctx.mul(&d01, &d02),
+        ctx.mul(&d10, &d12),
+        ctx.mul(&d20, &d21),
+    ];
+    let denominator_inverses = ctx.batch_inv(&denominators)?;
+    let a0 = ctx.sub(alpha, p0);
+    let a1 = ctx.sub(alpha, p1);
+    let a2 = ctx.sub(alpha, p2);
+    let numerators = [ctx.mul(&a1, &a2), ctx.mul(&a0, &a2), ctx.mul(&a0, &a1)];
+
+    let mut out = ctx.zero();
+    for index in 0..3 {
+        let basis_value = ctx.mul(&numerators[index], &denominator_inverses[index]);
         out = ctx.add(&out, &ctx.mul(&fiber_values[index], &basis_value));
     }
     Ok(out)

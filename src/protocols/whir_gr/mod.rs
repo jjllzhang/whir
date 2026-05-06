@@ -1,3 +1,4 @@
+pub mod bench_support;
 pub mod common;
 pub mod constraint;
 pub mod folding;

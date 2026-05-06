@@ -16,6 +16,10 @@ impl GrElem {
         &self.coefficients
     }
 
+    pub(crate) fn coefficients_mut(&mut self) -> &mut [u64] {
+        &mut self.coefficients
+    }
+
     pub fn into_coefficients(self) -> Vec<u64> {
         self.coefficients
     }

@@ -128,6 +128,10 @@ impl GrContext {
         self.coeff_bytes * self.config.r
     }
 
+    pub const fn mul_scratch_len(&self) -> usize {
+        self.config.r.saturating_mul(2).saturating_sub(1)
+    }
+
     pub const fn modulus(&self) -> u128 {
         1u128 << self.config.k_exp
     }
@@ -195,6 +199,20 @@ impl GrContext {
         )
     }
 
+    pub fn add_into(&self, out: &mut GrElem, lhs: &GrElem, rhs: &GrElem) {
+        self.debug_assert_element(out);
+        self.debug_assert_element(lhs);
+        self.debug_assert_element(rhs);
+        for ((out, &lhs), &rhs) in out
+            .coefficients_mut()
+            .iter_mut()
+            .zip(lhs.coefficients())
+            .zip(rhs.coefficients())
+        {
+            *out = self.normalize(lhs.wrapping_add(rhs));
+        }
+    }
+
     pub fn sub(&self, lhs: &GrElem, rhs: &GrElem) -> GrElem {
         self.debug_assert_element(lhs);
         self.debug_assert_element(rhs);
@@ -205,6 +223,20 @@ impl GrContext {
                 .map(|(&lhs, &rhs)| self.normalize(lhs.wrapping_sub(rhs)))
                 .collect(),
         )
+    }
+
+    pub fn sub_into(&self, out: &mut GrElem, lhs: &GrElem, rhs: &GrElem) {
+        self.debug_assert_element(out);
+        self.debug_assert_element(lhs);
+        self.debug_assert_element(rhs);
+        for ((out, &lhs), &rhs) in out
+            .coefficients_mut()
+            .iter_mut()
+            .zip(lhs.coefficients())
+            .zip(rhs.coefficients())
+        {
+            *out = self.normalize(lhs.wrapping_sub(rhs));
+        }
     }
 
     pub fn neg(&self, value: &GrElem) -> GrElem {
@@ -234,8 +266,62 @@ impl GrContext {
         self.reduce_coefficients(coefficients)
     }
 
+    pub fn mul_into(&self, out: &mut GrElem, lhs: &GrElem, rhs: &GrElem, scratch: &mut [u64]) {
+        self.debug_assert_element(out);
+        self.debug_assert_element(lhs);
+        self.debug_assert_element(rhs);
+        debug_assert!(scratch.len() >= self.mul_scratch_len());
+
+        let scratch_len = self.mul_scratch_len();
+        let scratch = &mut scratch[..scratch_len];
+        scratch.fill(0);
+        for (lhs_index, &lhs_coefficient) in lhs.coefficients().iter().enumerate() {
+            for (rhs_index, &rhs_coefficient) in rhs.coefficients().iter().enumerate() {
+                let product = self.mul_coeff(lhs_coefficient, rhs_coefficient);
+                let index = lhs_index + rhs_index;
+                scratch[index] = self.normalize(scratch[index].wrapping_add(product));
+            }
+        }
+
+        for degree in (self.config.r..scratch.len()).rev() {
+            let coefficient = scratch[degree];
+            if coefficient == 0 {
+                continue;
+            }
+            scratch[degree] = 0;
+            let offset = degree - self.config.r;
+            for (index, &defining_coefficient) in self.reduction_coefficients.iter().enumerate() {
+                if defining_coefficient == 1 {
+                    let target = offset + index;
+                    scratch[target] = self.normalize(scratch[target].wrapping_sub(coefficient));
+                }
+            }
+        }
+
+        for (out, &coefficient) in out
+            .coefficients_mut()
+            .iter_mut()
+            .zip(scratch.iter().take(self.config.r))
+        {
+            *out = self.normalize(coefficient);
+        }
+    }
+
+    pub fn mul_base_scalar_into(&self, out: &mut GrElem, value: &GrElem, scalar: u64) {
+        self.debug_assert_element(out);
+        self.debug_assert_element(value);
+        let scalar = self.normalize(scalar);
+        for (out, &coefficient) in out.coefficients_mut().iter_mut().zip(value.coefficients()) {
+            *out = self.mul_coeff(coefficient, scalar);
+        }
+    }
+
     pub fn square(&self, value: &GrElem) -> GrElem {
         self.mul(value, value)
+    }
+
+    pub fn square_into(&self, out: &mut GrElem, value: &GrElem, scratch: &mut [u64]) {
+        self.mul_into(out, value, value, scratch);
     }
 
     pub fn pow(&self, base: &GrElem, mut exponent: u128) -> GrElem {
@@ -330,12 +416,18 @@ impl GrContext {
     pub fn serialize(&self, value: &GrElem) -> Vec<u8> {
         self.debug_assert_element(value);
         let mut out = vec![0; self.elem_bytes()];
+        self.serialize_into(&mut out, value);
+        out
+    }
+
+    pub fn serialize_into(&self, out: &mut [u8], value: &GrElem) {
+        self.debug_assert_element(value);
+        debug_assert_eq!(out.len(), self.elem_bytes());
         for (coefficient_index, &coefficient) in value.coefficients().iter().enumerate() {
             let offset = coefficient_index * self.coeff_bytes;
             out[offset..offset + self.coeff_bytes]
                 .copy_from_slice(&coefficient.to_le_bytes()[..self.coeff_bytes]);
         }
-        out
     }
 
     pub fn deserialize(&self, bytes: &[u8]) -> Result<GrElem> {
@@ -498,6 +590,34 @@ mod tests {
             ctx.from_coefficients(&[u16::MAX.into(), u16::MAX.into()])
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn in_place_arithmetic_should_match_allocating_apis() {
+        let ctx = small_context();
+        let lhs = ctx.from_coefficients(&[0x1234, 0xFEDC]).unwrap();
+        let rhs = ctx.from_coefficients(&[0x0102, 0x0304]).unwrap();
+        let mut out = ctx.zero();
+        let mut scratch = vec![0; ctx.mul_scratch_len()];
+
+        ctx.add_into(&mut out, &lhs, &rhs);
+        assert_eq!(out, ctx.add(&lhs, &rhs));
+
+        ctx.sub_into(&mut out, &lhs, &rhs);
+        assert_eq!(out, ctx.sub(&lhs, &rhs));
+
+        ctx.mul_into(&mut out, &lhs, &rhs, &mut scratch);
+        assert_eq!(out, ctx.mul(&lhs, &rhs));
+
+        ctx.mul_base_scalar_into(&mut out, &lhs, 17);
+        assert_eq!(out, ctx.mul(&lhs, &ctx.from_u64(17)));
+
+        ctx.square_into(&mut out, &lhs, &mut scratch);
+        assert_eq!(out, ctx.square(&lhs));
+
+        let mut serialized = vec![0; ctx.elem_bytes()];
+        ctx.serialize_into(&mut serialized, &lhs);
+        assert_eq!(serialized, vec![0x34, 0x12, 0xdc, 0xfe]);
     }
 
     #[test]

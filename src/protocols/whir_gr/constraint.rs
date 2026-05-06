@@ -255,24 +255,33 @@ where
     let interpolation_points = sumcheck_interpolation_points(ctx)?;
     let remaining_count = variable_count - prefix.len() as u64 - 1;
     let assignment_count = pow3_small(remaining_count)?;
+    let assignment_count_usize = checked_size(assignment_count, "sumcheck assignment count")?;
+    let constraint_plan = SumcheckConstraintPlan::new(
+        ctx,
+        constraint,
+        prefix,
+        &interpolation_points,
+        remaining_count,
+        assignment_count_usize,
+    )?;
     let mut full_point = vec![ctx.zero(); variable_count_usize];
     full_point[..prefix.len()].clone_from_slice(prefix);
     let variable_index = prefix.len();
     let suffix_begin = variable_index + 1;
 
     let mut values = Vec::with_capacity(interpolation_points.len());
-    for t in &interpolation_points {
+    for (t_index, t) in interpolation_points.iter().enumerate() {
         full_point[variable_index] = t.clone();
         let mut h_t = ctx.zero();
-        for assignment in 0..assignment_count {
+        for assignment in 0..assignment_count_usize {
             append_grid_assignment(
                 constraint.grid(),
-                assignment,
+                assignment as u64,
                 &mut full_point[suffix_begin..],
             );
             let product = ctx.mul(
                 &evaluate_f(&full_point)?,
-                &constraint.evaluate_a(ctx, &full_point)?,
+                constraint_plan.value(t_index, assignment),
             );
             h_t = ctx.add(&h_t, &product);
         }
@@ -282,6 +291,115 @@ where
     Ok(WhirGrSumcheckPolynomial {
         coefficients: interpolate(ctx, &interpolation_points, &values)?,
     })
+}
+
+struct SumcheckConstraintPlan {
+    assignment_count: usize,
+    values: Vec<GrElem>,
+}
+
+impl SumcheckConstraintPlan {
+    fn new(
+        ctx: &GrContext,
+        constraint: &WhirConstraint,
+        prefix: &[GrElem],
+        interpolation_points: &[GrElem],
+        remaining_count: u64,
+        assignment_count: usize,
+    ) -> Result<Self> {
+        require_valid_grid(ctx, constraint.grid())?;
+        let mut values = vec![ctx.zero(); interpolation_points.len() * assignment_count];
+        if constraint.is_empty() {
+            return Ok(Self {
+                assignment_count,
+                values,
+            });
+        }
+
+        let live_index = prefix.len();
+        let suffix_begin = live_index + 1;
+        for term in constraint.terms() {
+            if term.point.len() < suffix_begin {
+                return Err(GrError::InvalidPolynomial(
+                    "sumcheck constraint term arity mismatch",
+                ));
+            }
+
+            let mut fixed_weight = term.weight.clone();
+            for (point, alpha) in term.point.iter().zip(prefix) {
+                fixed_weight = ctx.mul(
+                    &fixed_weight,
+                    &eq_b_coordinate(ctx, constraint.grid(), point, alpha)?,
+                );
+            }
+
+            let live_weights = interpolation_points
+                .iter()
+                .map(|t| {
+                    Ok(ctx.mul(
+                        &fixed_weight,
+                        &eq_b_coordinate(ctx, constraint.grid(), &term.point[live_index], t)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let suffix_basis = term.point[suffix_begin..]
+                .iter()
+                .map(|point| {
+                    Ok([
+                        lagrange_basis_on_ternary_grid(ctx, constraint.grid(), 0, point)?,
+                        lagrange_basis_on_ternary_grid(ctx, constraint.grid(), 1, point)?,
+                        lagrange_basis_on_ternary_grid(ctx, constraint.grid(), 2, point)?,
+                    ])
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if suffix_basis.len() != checked_size(remaining_count, "sumcheck suffix count")? {
+                return Err(GrError::InvalidPolynomial(
+                    "sumcheck suffix basis length mismatch",
+                ));
+            }
+
+            let suffix_products =
+                suffix_products(ctx, &suffix_basis, assignment_count, remaining_count)?;
+            for (t_index, live_weight) in live_weights.iter().enumerate() {
+                let row_offset = t_index * assignment_count;
+                for (assignment, suffix_product) in suffix_products.iter().enumerate() {
+                    let contribution = ctx.mul(live_weight, suffix_product);
+                    values[row_offset + assignment] =
+                        ctx.add(&values[row_offset + assignment], &contribution);
+                }
+            }
+        }
+
+        Ok(Self {
+            assignment_count,
+            values,
+        })
+    }
+
+    fn value(&self, t_index: usize, assignment: usize) -> &GrElem {
+        &self.values[t_index * self.assignment_count + assignment]
+    }
+}
+
+fn suffix_products(
+    ctx: &GrContext,
+    suffix_basis: &[[GrElem; 3]],
+    assignment_count: usize,
+    remaining_count: u64,
+) -> Result<Vec<GrElem>> {
+    let mut out = Vec::with_capacity(assignment_count);
+    for mut assignment in 0..assignment_count as u64 {
+        let mut product = ctx.one();
+        for basis in suffix_basis
+            .iter()
+            .take(checked_size(remaining_count, "suffix count")?)
+        {
+            product = ctx.mul(&product, &basis[(assignment % 3) as usize]);
+            assignment /= 3;
+        }
+        out.push(product);
+    }
+    Ok(out)
 }
 
 pub const fn sumcheck_declared_degree(polynomial: &WhirGrSumcheckPolynomial) -> usize {
@@ -573,6 +691,56 @@ mod tests {
             restricted.evaluate_a(&ctx, &tail).unwrap(),
             constraint.evaluate_a(&ctx, &full_point).unwrap()
         );
+    }
+
+    #[test]
+    fn sumcheck_constraint_plan_should_match_direct_evaluation() {
+        let ctx = sample_context();
+        let grid = make_grid(&ctx);
+        let first_point = sample_point(&ctx, &grid, 3);
+        let second_point = vec![
+            grid[2].clone(),
+            ctx.add(&grid[0], &ctx.from_u64(3)),
+            grid[1].clone(),
+        ];
+        let prefix = vec![ctx.add(&grid[1], &ctx.from_u64(5))];
+        let interpolation_points = sumcheck_interpolation_points(&ctx).unwrap();
+        let constraint = WhirConstraint::with_terms(
+            grid.clone(),
+            vec![
+                EqTerm {
+                    weight: ctx.from_u64(2),
+                    point: first_point,
+                },
+                EqTerm {
+                    weight: ctx.add(&grid[1], &ctx.one()),
+                    point: second_point,
+                },
+            ],
+        )
+        .unwrap();
+        let plan = super::SumcheckConstraintPlan::new(
+            &ctx,
+            &constraint,
+            &prefix,
+            &interpolation_points,
+            1,
+            3,
+        )
+        .unwrap();
+
+        for (t_index, t) in interpolation_points.iter().enumerate() {
+            for (assignment, grid_point) in grid.iter().enumerate() {
+                let mut point = prefix.clone();
+                point.push(t.clone());
+                point.push(grid_point.clone());
+
+                assert_eq!(
+                    plan.value(t_index, assignment),
+                    &constraint.evaluate_a(&ctx, &point).unwrap()
+                );
+            }
+        }
     }
 
     #[test]

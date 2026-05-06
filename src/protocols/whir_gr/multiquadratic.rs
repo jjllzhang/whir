@@ -70,8 +70,13 @@ impl MultiQuadraticPolynomial {
 
     pub fn evaluate_pow(&self, ctx: &GrContext, x: &GrElem) -> GrElem {
         let mut acc = ctx.zero();
+        let mut product = ctx.zero();
+        let mut next_acc = ctx.zero();
+        let mut scratch = vec![0; ctx.mul_scratch_len()];
         for coefficient in self.coefficients.iter().rev() {
-            acc = ctx.add(&ctx.mul(&acc, x), coefficient);
+            ctx.mul_into(&mut product, &acc, x, &mut scratch);
+            ctx.add_into(&mut next_acc, &product, coefficient);
+            std::mem::swap(&mut acc, &mut next_acc);
         }
         acc
     }

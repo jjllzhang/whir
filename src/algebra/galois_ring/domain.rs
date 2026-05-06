@@ -79,13 +79,36 @@ impl Domain {
     }
 
     pub fn elements(&self) -> Vec<GrElem> {
-        let mut values = Vec::with_capacity(self.size as usize);
-        let mut current = self.offset.clone();
-        for _ in 0..self.size {
-            values.push(current.clone());
-            current = self.ctx.mul(&current, &self.root);
+        self.iter_elements().collect()
+    }
+
+    pub fn iter_elements(&self) -> DomainElements<'_> {
+        DomainElements {
+            domain: self,
+            next: self.offset.clone(),
+            product: self.ctx.zero(),
+            scratch: vec![0; self.ctx.mul_scratch_len()],
+            remaining: self.size,
         }
-        values
+    }
+
+    pub fn iter_elements_from(&self, begin: u64) -> Result<DomainElements<'_>> {
+        if begin > self.size {
+            return Err(GrError::IndexOutOfRange {
+                index: begin,
+                size: self.size,
+            });
+        }
+
+        Ok(DomainElements {
+            domain: self,
+            next: self
+                .ctx
+                .mul(&self.offset, &self.ctx.pow(&self.root, begin.into())),
+            product: self.ctx.zero(),
+            scratch: vec![0; self.ctx.mul_scratch_len()],
+            remaining: self.size - begin,
+        })
     }
 
     pub fn contains(&self, value: &GrElem) -> bool {
@@ -162,6 +185,44 @@ impl Domain {
     }
 }
 
+pub struct DomainElements<'a> {
+    domain: &'a Domain,
+    next: GrElem,
+    product: GrElem,
+    scratch: Vec<u64>,
+    remaining: u64,
+}
+
+impl Iterator for DomainElements<'_> {
+    type Item = GrElem;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+
+        let value = self.next.clone();
+        self.remaining -= 1;
+        if self.remaining != 0 {
+            self.domain.ctx.mul_into(
+                &mut self.product,
+                &self.next,
+                &self.domain.root,
+                &mut self.scratch,
+            );
+            std::mem::swap(&mut self.next, &mut self.product);
+        }
+        Some(value)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = usize::try_from(self.remaining).unwrap_or(usize::MAX);
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for DomainElements<'_> {}
+
 const fn gcd(mut lhs: u64, mut rhs: u64) -> u64 {
     while rhs != 0 {
         let remainder = lhs % rhs;
@@ -223,6 +284,27 @@ mod tests {
         assert_ne!(domain.root(), &ctx.one());
         assert_eq!(ctx.pow(domain.root(), 3), *domain.scale(3).unwrap().root());
         assert_eq!(domain.pow_map(9).unwrap().element(0).unwrap(), ctx.one());
+    }
+
+    #[test]
+    fn domain_iterators_should_match_random_access() {
+        let ctx = ctx_r6();
+        let subgroup = Domain::teichmuller_subgroup(Arc::clone(&ctx), 9).unwrap();
+        let coset =
+            Domain::teichmuller_coset(Arc::clone(&ctx), teichmuller_generator(&ctx).unwrap(), 9)
+                .unwrap();
+
+        for domain in [&subgroup, &coset] {
+            let iterated = domain.iter_elements().collect::<Vec<_>>();
+            let random_access = (0..domain.size())
+                .map(|index| domain.element(index).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(iterated, random_access);
+
+            let suffix = domain.iter_elements_from(4).unwrap().collect::<Vec<_>>();
+            assert_eq!(suffix.as_slice(), &random_access[4..]);
+            assert!(domain.iter_elements_from(domain.size() + 1).is_err());
+        }
     }
 
     #[test]
