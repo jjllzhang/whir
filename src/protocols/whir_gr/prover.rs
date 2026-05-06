@@ -22,6 +22,7 @@ use crate::{
         multiquadratic::{
             pow2_checked, pow3_checked, pow_m, MultiQuadraticPolynomial, MultilinearPolynomial,
         },
+        oracle_encoding::rs_encode_teichmuller_coset,
         serialization::{
             serialize_public_parameters, serialize_ring_vector, serialize_sumcheck_polynomial,
             WhirGrOpeningPayload,
@@ -183,11 +184,16 @@ impl<'a> WhirGrProver<'a> {
         }
 
         let mut timings = WhirGrCommitTimings::default();
+        let dense_start = capture_timings.then(Instant::now);
+        let dense_polynomial = polynomial.to_multi_quadratic(&self.public_params.ctx)?;
+        record_elapsed(&mut timings.to_multiquadratic_ms, dense_start);
+
         let encode_start = capture_timings.then(Instant::now);
-        let initial_oracle = encode_multilinear_oracle(
+        let initial_oracle = encode_multilinear_oracle_with_structured_encoding(
             self.public_params,
             &self.public_params.initial_domain,
             polynomial,
+            &dense_polynomial,
         )?;
         record_elapsed(&mut timings.encode_oracle_ms, encode_start);
 
@@ -201,12 +207,9 @@ impl<'a> WhirGrProver<'a> {
         let oracle_root = initial_tree.root();
         let commitment = WhirGrCommitment { oracle_root };
 
-        let dense_start = capture_timings.then(Instant::now);
-        let polynomial = polynomial.to_multi_quadratic(&self.public_params.ctx)?;
-        record_elapsed(&mut timings.to_multiquadratic_ms, dense_start);
         let state = WhirGrCommitmentState {
             public_params: self.public_params.clone(),
-            polynomial,
+            polynomial: dense_polynomial,
             initial_tree,
             initial_oracle,
             oracle_root,
@@ -557,6 +560,13 @@ pub(crate) fn encode_oracle(
     if domain.context().config() != params.ctx.config() {
         return Err(GrError::DifferentRings);
     }
+    if should_try_structured_oracle_encoding(domain, polynomial) {
+        if let Some(oracle) =
+            rs_encode_teichmuller_coset(&params.ctx, domain, polynomial.coefficients())?
+        {
+            return Ok(oracle);
+        }
+    }
     #[cfg(feature = "parallel")]
     {
         if domain.size() >= PARALLEL_ORACLE_THRESHOLD && rayon::current_num_threads() > 1 {
@@ -565,6 +575,31 @@ pub(crate) fn encode_oracle(
     }
     encode_oracle_sequential(params, domain, polynomial)
 }
+
+#[cfg(test)]
+pub(crate) fn encode_oracle_horner_reference(
+    params: &WhirGrPublicParameters,
+    domain: &Domain,
+    polynomial: &MultiQuadraticPolynomial,
+) -> Result<Vec<GrElem>> {
+    if domain.context().config() != params.ctx.config() {
+        return Err(GrError::DifferentRings);
+    }
+    encode_oracle_sequential(params, domain, polynomial)
+}
+
+fn should_try_structured_oracle_encoding(
+    domain: &Domain,
+    polynomial: &MultiQuadraticPolynomial,
+) -> bool {
+    let coefficient_count = polynomial.coefficients().len() as u64;
+    domain.size() >= STRUCTURED_ORACLE_THRESHOLD
+        && coefficient_count > 1
+        && coefficient_count.saturating_mul(domain.size()) >= STRUCTURED_ORACLE_WORK_THRESHOLD
+}
+
+const STRUCTURED_ORACLE_THRESHOLD: u64 = 10_000;
+const STRUCTURED_ORACLE_WORK_THRESHOLD: u64 = 16_384;
 
 fn encode_oracle_sequential(
     params: &WhirGrPublicParameters,
@@ -634,6 +669,22 @@ pub(crate) fn encode_multilinear_oracle(
         }
     }
     encode_multilinear_oracle_sequential(params, domain, polynomial)
+}
+
+fn encode_multilinear_oracle_with_structured_encoding(
+    params: &WhirGrPublicParameters,
+    domain: &Domain,
+    polynomial: &MultilinearPolynomial,
+    dense_polynomial: &MultiQuadraticPolynomial,
+) -> Result<Vec<GrElem>> {
+    if should_try_structured_oracle_encoding(domain, dense_polynomial) {
+        if let Some(oracle) =
+            rs_encode_teichmuller_coset(&params.ctx, domain, dense_polynomial.coefficients())?
+        {
+            return Ok(oracle);
+        }
+    }
+    encode_multilinear_oracle(params, domain, polynomial)
 }
 
 const PARALLEL_ORACLE_THRESHOLD: u64 = 1024;
@@ -974,15 +1025,17 @@ mod tests {
     #[cfg(feature = "parallel")]
     use crate::protocols::whir_gr::prover::encode_multilinear_oracle_parallel;
     use crate::{
-        algebra::galois_ring::{Domain, GrConfig, GrContext, GrElem},
+        algebra::galois_ring::{teichmuller_generator, Domain, GrConfig, GrContext, GrElem},
         protocols::whir_gr::{
             bench_support,
             common::WhirGrPublicParameters,
             constraint::ternary_grid,
+            merkle::build_oracle_tree,
             multiquadratic::{pow2_checked, MultiQuadraticPolynomial, MultilinearPolynomial},
+            oracle_encoding::rs_encode_teichmuller_coset,
             prover::{
                 encode_multilinear_oracle, encode_multilinear_oracle_sequential, encode_oracle,
-                WhirGrProver,
+                encode_oracle_horner_reference, WhirGrProver,
             },
             serialization::serialize_public_parameters,
             verifier::WhirGrVerifier,
@@ -1130,6 +1183,82 @@ mod tests {
             assert_eq!(
                 prover.commit_multilinear(&multilinear).unwrap().0,
                 prover.commit(&embedded).unwrap().0
+            );
+        }
+    }
+
+    #[test]
+    fn structured_oracle_encoding_should_match_horner_reference() {
+        let case = bench_support::find_case("m6").unwrap();
+        let params = bench_support::build_params(case).unwrap();
+        let poly = polynomial(&params.ctx, 4);
+
+        assert_eq!(
+            rs_encode_teichmuller_coset(&params.ctx, &params.initial_domain, poly.coefficients())
+                .unwrap()
+                .unwrap(),
+            encode_oracle_horner_reference(&params, &params.initial_domain, &poly).unwrap()
+        );
+    }
+
+    #[test]
+    fn structured_oracle_encoding_should_match_horner_reference_on_coset() {
+        let params = public_parameters(3, 1);
+        let offset = teichmuller_generator(&params.ctx).unwrap();
+        let domain = Domain::teichmuller_coset(Arc::clone(&params.ctx), offset, 81).unwrap();
+        let poly = polynomial(&params.ctx, 3);
+
+        assert_eq!(
+            rs_encode_teichmuller_coset(&params.ctx, &domain, poly.coefficients())
+                .unwrap()
+                .unwrap(),
+            encode_oracle_horner_reference(&params, &domain, &poly).unwrap()
+        );
+    }
+
+    #[test]
+    fn structured_oracle_encoding_should_preserve_merkle_root() {
+        let case = bench_support::find_case("m6").unwrap();
+        let params = bench_support::build_params(case).unwrap();
+        let poly = polynomial(&params.ctx, 4);
+        let encoded =
+            rs_encode_teichmuller_coset(&params.ctx, &params.initial_domain, poly.coefficients())
+                .unwrap()
+                .unwrap();
+        let reference =
+            encode_oracle_horner_reference(&params, &params.initial_domain, &poly).unwrap();
+
+        assert_eq!(
+            build_oracle_tree(params.hash_id, &params.ctx, &encoded)
+                .unwrap()
+                .root(),
+            build_oracle_tree(params.hash_id, &params.ctx, &reference)
+                .unwrap()
+                .root()
+        );
+    }
+
+    #[test]
+    fn structured_oracle_encoding_should_cover_small_bench_domain_shapes() {
+        let coefficient_count = 9;
+        for case in bench_support::WHIR_GR_SMALL_CASES {
+            let params = bench_support::build_params(case).unwrap();
+            let coefficients = (0..coefficient_count)
+                .map(|index| params.ctx.from_u64((case.variable_count + 17 * index) % 37))
+                .collect();
+            let poly = MultiQuadraticPolynomial::new(2, coefficients).unwrap();
+
+            assert_eq!(
+                rs_encode_teichmuller_coset(
+                    &params.ctx,
+                    &params.initial_domain,
+                    poly.coefficients()
+                )
+                .unwrap()
+                .unwrap(),
+                encode_oracle_horner_reference(&params, &params.initial_domain, &poly).unwrap(),
+                "{}",
+                case.short_name()
             );
         }
     }

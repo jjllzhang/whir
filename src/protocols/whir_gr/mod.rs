@@ -4,6 +4,7 @@ pub mod constraint;
 pub mod folding;
 pub mod merkle;
 pub mod multiquadratic;
+pub(crate) mod oracle_encoding;
 pub mod prover;
 pub mod serialization;
 pub mod soundness;
