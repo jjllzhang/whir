@@ -298,6 +298,43 @@ impl Config {
         Ok(sibling_hashes)
     }
 
+    pub fn open_compact_paths(
+        &self,
+        witness: &Witness,
+        indices: &[usize],
+    ) -> VerificationResult<Vec<Hash>> {
+        verify!(witness.nodes.len() == self.num_nodes());
+        verify!(indices.iter().all(|&i| i < self.num_leaves));
+
+        let mut sibling_hashes = Vec::new();
+        let mut indices = indices.to_vec();
+        indices.sort_unstable();
+        indices.dedup();
+        let (mut layer, mut remaining) = witness.nodes.split_at(1 << self.layers.len());
+        while layer.len() > 1 {
+            let mut next_indices = Vec::with_capacity(indices.len());
+            let mut iter = indices.iter().copied().peekable();
+            loop {
+                match (iter.next(), iter.peek()) {
+                    (Some(a), Some(&b)) if b == a ^ 1 => {
+                        next_indices.push(a >> 1);
+                        iter.next();
+                    }
+                    (Some(a), _) => {
+                        sibling_hashes.push(layer[a ^ 1]);
+                        next_indices.push(a >> 1);
+                    }
+                    (None, _) => break,
+                }
+            }
+            indices = next_indices;
+            let (next_layer, next_remaining) = remaining.split_at(layer.len() / 2);
+            layer = next_layer;
+            remaining = next_remaining;
+        }
+        Ok(sibling_hashes)
+    }
+
     pub fn verify_paths(
         &self,
         commitment: &Commitment,
@@ -325,6 +362,81 @@ impl Config {
             }
             verify!(current == commitment.hash);
         }
+        Ok(())
+    }
+
+    pub fn verify_compact_paths(
+        &self,
+        commitment: &Commitment,
+        indices: &[usize],
+        leaf_hashes: &[Hash],
+        sibling_hashes: &[Hash],
+    ) -> VerificationResult<()> {
+        verify!(indices.len() == leaf_hashes.len());
+        verify!(indices.iter().all(|&i| i < self.num_leaves));
+        if indices.is_empty() {
+            verify!(sibling_hashes.is_empty());
+            return Ok(());
+        }
+
+        let mut layer = zip_strict(indices.iter().copied(), leaf_hashes.iter().copied())
+            .collect::<Vec<(usize, Hash)>>();
+        layer.sort_unstable_by_key(|(i, _)| *i);
+        for i in 1..layer.len() {
+            if layer[i - 1].0 == layer[i].0 {
+                verify!(layer[i - 1].1 == layer[i].1);
+            }
+        }
+        layer.dedup_by_key(|(i, _)| *i);
+
+        let mut indices = layer.iter().map(|(i, _)| *i).collect::<Vec<_>>();
+        let mut hashes = layer.iter().map(|(_, h)| *h).collect::<Vec<_>>();
+        let mut siblings = sibling_hashes.iter();
+        let mut next_indices = Vec::with_capacity(layer.len());
+        let mut input_hashes = Vec::with_capacity(layer.len() * 2);
+        let mut next_hashes = Vec::with_capacity(layer.len());
+        for layer in self.layers.iter().rev() {
+            next_indices.clear();
+            input_hashes.clear();
+            next_hashes.clear();
+
+            let mut indices_iter = indices.iter().copied().peekable();
+            let mut hashes_iter = hashes.iter().copied();
+            loop {
+                match (indices_iter.next(), indices_iter.peek()) {
+                    (Some(a), Some(&b)) if b == a ^ 1 => {
+                        input_hashes.push(hashes_iter.next().unwrap());
+                        input_hashes.push(hashes_iter.next().unwrap());
+                        next_indices.push(a >> 1);
+                        indices_iter.next();
+                    }
+                    (Some(a), _) => {
+                        let sibling = siblings.next().ok_or(VerificationError)?;
+                        if a & 1 == 0 {
+                            input_hashes.push(hashes_iter.next().unwrap());
+                            input_hashes.push(*sibling);
+                        } else {
+                            input_hashes.push(*sibling);
+                            input_hashes.push(hashes_iter.next().unwrap());
+                        }
+                        next_indices.push(a >> 1);
+                    }
+                    (None, _) => break,
+                }
+            }
+
+            next_hashes.resize(input_hashes.len() / 2, Hash::default());
+            ENGINES
+                .retrieve(layer.hash_id)
+                .ok_or(VerificationError)?
+                .hash_many(64, input_hashes.as_bytes(), &mut next_hashes);
+            swap(&mut indices, &mut next_indices);
+            swap(&mut hashes, &mut next_hashes);
+        }
+
+        verify!(siblings.next().is_none());
+        verify!(indices == [0]);
+        verify!(hashes == [commitment.hash]);
         Ok(())
     }
 }
@@ -455,6 +567,88 @@ pub(crate) mod tests {
         bad_paths[0].0[0] ^= 1;
         assert!(config
             .verify_paths(&commitment, &indices, &[leaves[1], leaves[6]], &bad_paths)
+            .is_err());
+    }
+
+    #[test]
+    fn compact_paths_should_verify_without_transcript_hints() {
+        crate::tests::init();
+        let config = Config::with_hash(BLAKE3, 8);
+        let leaves = (0..config.num_leaves)
+            .map(|i| Hash([i as u8; 32]))
+            .collect::<Vec<_>>();
+        let (commitment, witness) = config.build(leaves.clone());
+
+        let indices = [1, 6];
+        let compact = config.open_compact_paths(&witness, &indices).unwrap();
+        let explicit = config.open_paths(&witness, &indices).unwrap();
+        assert!(compact.len() <= explicit.len());
+        config
+            .verify_compact_paths(&commitment, &indices, &[leaves[1], leaves[6]], &compact)
+            .unwrap();
+
+        let mut bad_compact = compact.clone();
+        bad_compact[0].0[0] ^= 1;
+        assert!(config
+            .verify_compact_paths(&commitment, &indices, &[leaves[1], leaves[6]], &bad_compact)
+            .is_err());
+
+        let mut extra_compact = compact;
+        extra_compact.push(Hash([99; 32]));
+        assert!(config
+            .verify_compact_paths(
+                &commitment,
+                &indices,
+                &[leaves[1], leaves[6]],
+                &extra_compact
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn compact_paths_should_merge_neighboring_queries() {
+        crate::tests::init();
+        let config = Config::with_hash(BLAKE3, 8);
+        let leaves = (0..config.num_leaves)
+            .map(|i| Hash([i as u8; 32]))
+            .collect::<Vec<_>>();
+        let (commitment, witness) = config.build(leaves.clone());
+
+        let indices = [0, 1];
+        let compact = config.open_compact_paths(&witness, &indices).unwrap();
+        let explicit = config.open_paths(&witness, &indices).unwrap();
+        assert!(compact.len() < explicit.len());
+        config
+            .verify_compact_paths(&commitment, &indices, &[leaves[0], leaves[1]], &compact)
+            .unwrap();
+    }
+
+    #[test]
+    fn compact_paths_should_canonicalize_duplicate_queries() {
+        crate::tests::init();
+        let config = Config::with_hash(BLAKE3, 8);
+        let leaves = (0..config.num_leaves)
+            .map(|i| Hash([i as u8; 32]))
+            .collect::<Vec<_>>();
+        let (commitment, witness) = config.build(leaves.clone());
+
+        let indices = [6, 1, 1];
+        let compact = config.open_compact_paths(&witness, &indices).unwrap();
+        config
+            .verify_compact_paths(
+                &commitment,
+                &indices,
+                &[leaves[6], leaves[1], leaves[1]],
+                &compact,
+            )
+            .unwrap();
+        assert!(config
+            .verify_compact_paths(
+                &commitment,
+                &indices,
+                &[leaves[6], leaves[1], leaves[2]],
+                &compact,
+            )
             .is_err());
     }
 

@@ -3,13 +3,17 @@ use crate::{
     hash::Hash,
     protocols::whir_gr::{
         common::{
-            WhirGrOpening, WhirGrProof, WhirGrPublicParameters, WhirGrRoundProof,
-            WhirGrSumcheckPolynomial,
+            WhirGrOpening, WhirGrProof, WhirGrProofHints, WhirGrPublicParameters, WhirGrRoundHints,
+            WhirGrRoundProof, WhirGrSumcheckPolynomial,
         },
-        merkle::MerkleProof,
+        merkle::{CompactMerkleProof, MerkleOpeningHint},
     },
     transcript::{Encoding, NargDeserialize, VerificationError, VerificationResult},
 };
+
+const OPENING_V2_MAGIC: [u8; 8] = *b"WGRPOV2\0";
+const OPENING_PROOF_V2_MAGIC: [u8; 8] = *b"WGRPPV2\0";
+const OPENING_HINT_V2_MAGIC: [u8; 8] = *b"WGRPHV2\0";
 
 #[derive(Clone, Debug, Default)]
 pub struct ByteWriter {
@@ -23,6 +27,16 @@ pub struct ByteReader<'a> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WhirGrOpeningPayload {
+    bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WhirGrOpeningProofPayload {
+    bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WhirGrOpeningHintPayload {
     bytes: Vec<u8>,
 }
 
@@ -190,31 +204,78 @@ impl WhirGrOpeningPayload {
     }
 }
 
-impl Encoding<[u8]> for WhirGrOpeningPayload {
-    fn encode(&self) -> impl AsRef<[u8]> {
-        let mut encoded = Vec::with_capacity(8 + self.bytes.len());
-        encoded.extend_from_slice(&(self.bytes.len() as u64).to_le_bytes());
-        encoded.extend_from_slice(&self.bytes);
-        encoded
+impl WhirGrOpeningProofPayload {
+    pub const fn new(bytes: Vec<u8>) -> Self {
+        Self { bytes }
+    }
+
+    pub fn from_opening(ctx: &GrContext, opening: &WhirGrOpening) -> Self {
+        Self::new(serialize_opening_proof(ctx, opening))
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn into_parts(
+        self,
+        ctx: &GrContext,
+    ) -> crate::algebra::galois_ring::Result<(GrElem, WhirGrProof)> {
+        deserialize_opening_proof(ctx, &self.bytes)
     }
 }
 
-impl NargDeserialize for WhirGrOpeningPayload {
-    fn deserialize_from_narg(buf: &mut &[u8]) -> VerificationResult<Self> {
-        if buf.len() < 8 {
-            return Err(VerificationError);
-        }
-        let (len_bytes, tail) = buf.split_at(8);
-        let len = u64::from_le_bytes(len_bytes.try_into().map_err(|_| VerificationError)?);
-        let len = usize::try_from(len).map_err(|_| VerificationError)?;
-        if tail.len() < len {
-            return Err(VerificationError);
-        }
-        let (payload, remaining) = tail.split_at(len);
-        *buf = remaining;
-        Ok(Self::new(payload.to_vec()))
+impl WhirGrOpeningHintPayload {
+    pub const fn new(bytes: Vec<u8>) -> Self {
+        Self { bytes }
+    }
+
+    pub fn from_opening(opening: &WhirGrOpening) -> Self {
+        Self::new(serialize_opening_hints(&opening.hints))
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn into_hints(self) -> crate::algebra::galois_ring::Result<WhirGrProofHints> {
+        deserialize_opening_hints(&self.bytes)
     }
 }
+
+macro_rules! impl_payload_codec {
+    ($type:ty) => {
+        impl Encoding<[u8]> for $type {
+            fn encode(&self) -> impl AsRef<[u8]> {
+                let mut encoded = Vec::with_capacity(8 + self.bytes.len());
+                encoded.extend_from_slice(&(self.bytes.len() as u64).to_le_bytes());
+                encoded.extend_from_slice(&self.bytes);
+                encoded
+            }
+        }
+
+        impl NargDeserialize for $type {
+            fn deserialize_from_narg(buf: &mut &[u8]) -> VerificationResult<Self> {
+                if buf.len() < 8 {
+                    return Err(VerificationError);
+                }
+                let (len_bytes, tail) = buf.split_at(8);
+                let len = u64::from_le_bytes(len_bytes.try_into().map_err(|_| VerificationError)?);
+                let len = usize::try_from(len).map_err(|_| VerificationError)?;
+                if tail.len() < len {
+                    return Err(VerificationError);
+                }
+                let (payload, remaining) = tail.split_at(len);
+                *buf = remaining;
+                Ok(Self::new(payload.to_vec()))
+            }
+        }
+    };
+}
+
+impl_payload_codec!(WhirGrOpeningPayload);
+impl_payload_codec!(WhirGrOpeningProofPayload);
+impl_payload_codec!(WhirGrOpeningHintPayload);
 
 pub fn serialize_ring_element(ctx: &GrContext, value: &GrElem) -> Vec<u8> {
     ctx.serialize(value)
@@ -267,7 +328,7 @@ pub fn serialize_sumcheck_polynomial(
     serialize_ring_vector(ctx, &polynomial.coefficients)
 }
 
-pub fn serialize_merkle_proof(proof: &MerkleProof) -> Vec<u8> {
+pub fn serialize_merkle_proof(proof: &CompactMerkleProof) -> Vec<u8> {
     let mut writer = ByteWriter::new();
     writer.write_u64(proof.leaf_count as u64);
     writer.write_u64_vector(
@@ -277,11 +338,16 @@ pub fn serialize_merkle_proof(proof: &MerkleProof) -> Vec<u8> {
             .map(|&index| index as u64)
             .collect::<Vec<_>>(),
     );
-    writer.write_byte_vectors(&proof.leaf_payloads);
     writer.write_u64(proof.sibling_hashes.len() as u64);
     for hash in &proof.sibling_hashes {
         writer.write_hash(hash);
     }
+    writer.into_bytes()
+}
+
+pub fn serialize_merkle_opening_hint(hint: &MerkleOpeningHint) -> Vec<u8> {
+    let mut writer = ByteWriter::new();
+    writer.write_byte_vectors(&hint.leaf_payloads);
     writer.into_bytes()
 }
 
@@ -296,6 +362,12 @@ pub fn serialize_round_proof(ctx: &GrContext, proof: &WhirGrRoundProof) -> Vec<u
     writer.into_bytes()
 }
 
+pub fn serialize_round_hints(hints: &WhirGrRoundHints) -> Vec<u8> {
+    serialize_merkle_opening_hint(&MerkleOpeningHint {
+        leaf_payloads: hints.virtual_fold_leaf_payloads.clone(),
+    })
+}
+
 pub fn serialize_proof(ctx: &GrContext, proof: &WhirGrProof) -> Vec<u8> {
     let mut writer = ByteWriter::new();
     writer.write_u64(proof.rounds.len() as u64);
@@ -307,10 +379,39 @@ pub fn serialize_proof(ctx: &GrContext, proof: &WhirGrProof) -> Vec<u8> {
     writer.into_bytes()
 }
 
-pub fn serialize_opening(ctx: &GrContext, opening: &WhirGrOpening) -> Vec<u8> {
+pub fn serialize_hints(hints: &WhirGrProofHints) -> Vec<u8> {
     let mut writer = ByteWriter::new();
+    writer.write_u64(hints.rounds.len() as u64);
+    for round in &hints.rounds {
+        writer.write_bytes(&serialize_round_hints(round));
+    }
+    writer.write_bytes(&serialize_merkle_opening_hint(&MerkleOpeningHint {
+        leaf_payloads: hints.final_leaf_payloads.clone(),
+    }));
+    writer.into_bytes()
+}
+
+pub fn serialize_opening_proof(ctx: &GrContext, opening: &WhirGrOpening) -> Vec<u8> {
+    let mut writer = ByteWriter::new();
+    writer.write_raw_bytes(&OPENING_PROOF_V2_MAGIC);
     writer.write_ring_element(ctx, &opening.value);
     writer.write_bytes(&serialize_proof(ctx, &opening.proof));
+    writer.into_bytes()
+}
+
+pub fn serialize_opening_hints(hints: &WhirGrProofHints) -> Vec<u8> {
+    let mut writer = ByteWriter::new();
+    writer.write_raw_bytes(&OPENING_HINT_V2_MAGIC);
+    writer.write_bytes(&serialize_hints(hints));
+    writer.into_bytes()
+}
+
+pub fn serialize_opening(ctx: &GrContext, opening: &WhirGrOpening) -> Vec<u8> {
+    let mut writer = ByteWriter::new();
+    writer.write_raw_bytes(&OPENING_V2_MAGIC);
+    writer.write_ring_element(ctx, &opening.value);
+    writer.write_bytes(&serialize_proof(ctx, &opening.proof));
+    writer.write_bytes(&serialize_hints(&opening.hints));
     writer.into_bytes()
 }
 
@@ -340,11 +441,22 @@ pub fn deserialize_sumcheck_polynomial(
     })
 }
 
-pub fn deserialize_merkle_proof(bytes: &[u8]) -> crate::algebra::galois_ring::Result<MerkleProof> {
+pub fn deserialize_merkle_proof(
+    bytes: &[u8],
+) -> crate::algebra::galois_ring::Result<CompactMerkleProof> {
     let mut reader = ByteReader::new(bytes);
     let proof = read_merkle_proof(&mut reader)?;
     ensure_eof(&reader)?;
     Ok(proof)
+}
+
+pub fn deserialize_merkle_opening_hint(
+    bytes: &[u8],
+) -> crate::algebra::galois_ring::Result<MerkleOpeningHint> {
+    let mut reader = ByteReader::new(bytes);
+    let hint = read_merkle_opening_hint(&mut reader)?;
+    ensure_eof(&reader)?;
+    Ok(hint)
 }
 
 pub fn deserialize_round_proof(
@@ -357,6 +469,17 @@ pub fn deserialize_round_proof(
     Ok(proof)
 }
 
+pub fn deserialize_round_hints(
+    bytes: &[u8],
+) -> crate::algebra::galois_ring::Result<WhirGrRoundHints> {
+    let mut reader = ByteReader::new(bytes);
+    let hint = read_merkle_opening_hint(&mut reader)?;
+    ensure_eof(&reader)?;
+    Ok(WhirGrRoundHints {
+        virtual_fold_leaf_payloads: hint.leaf_payloads,
+    })
+}
+
 pub fn deserialize_proof(
     ctx: &GrContext,
     bytes: &[u8],
@@ -367,21 +490,59 @@ pub fn deserialize_proof(
     Ok(proof)
 }
 
+pub fn deserialize_hints(bytes: &[u8]) -> crate::algebra::galois_ring::Result<WhirGrProofHints> {
+    let mut reader = ByteReader::new(bytes);
+    let hints = read_hints(&mut reader)?;
+    ensure_eof(&reader)?;
+    Ok(hints)
+}
+
+pub fn deserialize_opening_proof(
+    ctx: &GrContext,
+    bytes: &[u8],
+) -> crate::algebra::galois_ring::Result<(GrElem, WhirGrProof)> {
+    let mut reader = ByteReader::new(bytes);
+    read_magic(&mut reader, OPENING_PROOF_V2_MAGIC)?;
+    let value = reader.read_ring_element(ctx)?;
+    let proof_bytes = reader.read_bytes()?;
+    let proof = deserialize_proof(ctx, &proof_bytes)?;
+    ensure_eof(&reader)?;
+    Ok((value, proof))
+}
+
+pub fn deserialize_opening_hints(
+    bytes: &[u8],
+) -> crate::algebra::galois_ring::Result<WhirGrProofHints> {
+    let mut reader = ByteReader::new(bytes);
+    read_magic(&mut reader, OPENING_HINT_V2_MAGIC)?;
+    let hint_bytes = reader.read_bytes()?;
+    let hints = deserialize_hints(&hint_bytes)?;
+    ensure_eof(&reader)?;
+    Ok(hints)
+}
+
 pub fn deserialize_opening(
     ctx: &GrContext,
     bytes: &[u8],
 ) -> crate::algebra::galois_ring::Result<WhirGrOpening> {
     let mut reader = ByteReader::new(bytes);
+    read_magic(&mut reader, OPENING_V2_MAGIC)?;
     let value = reader.read_ring_element(ctx)?;
     let proof_bytes = reader.read_bytes()?;
     let proof = deserialize_proof(ctx, &proof_bytes)?;
+    let hint_bytes = reader.read_bytes()?;
+    let hints = deserialize_hints(&hint_bytes)?;
     ensure_eof(&reader)?;
-    Ok(WhirGrOpening { value, proof })
+    Ok(WhirGrOpening {
+        value,
+        proof,
+        hints,
+    })
 }
 
 fn read_merkle_proof(
     reader: &mut ByteReader<'_>,
-) -> crate::algebra::galois_ring::Result<MerkleProof> {
+) -> crate::algebra::galois_ring::Result<CompactMerkleProof> {
     let leaf_count = reader.read_u64()?;
     let leaf_count = usize::try_from(leaf_count).map_err(|_| {
         crate::algebra::galois_ring::GrError::ArithmeticOverflow("Merkle leaf count")
@@ -395,7 +556,6 @@ fn read_merkle_proof(
             })
         })
         .collect::<crate::algebra::galois_ring::Result<Vec<_>>>()?;
-    let leaf_payloads = reader.read_byte_vectors()?;
     let sibling_count = reader.read_u64()?;
     let sibling_count = usize::try_from(sibling_count).map_err(|_| {
         crate::algebra::galois_ring::GrError::ArithmeticOverflow("Merkle sibling count")
@@ -403,11 +563,18 @@ fn read_merkle_proof(
     let sibling_hashes = (0..sibling_count)
         .map(|_| reader.read_hash())
         .collect::<crate::algebra::galois_ring::Result<Vec<_>>>()?;
-    Ok(MerkleProof {
+    Ok(CompactMerkleProof {
         leaf_count,
         queried_indices,
-        leaf_payloads,
         sibling_hashes,
+    })
+}
+
+fn read_merkle_opening_hint(
+    reader: &mut ByteReader<'_>,
+) -> crate::algebra::galois_ring::Result<MerkleOpeningHint> {
+    Ok(MerkleOpeningHint {
+        leaf_payloads: reader.read_byte_vectors()?,
     })
 }
 
@@ -434,6 +601,26 @@ fn read_round_proof(
     })
 }
 
+fn read_hints(
+    reader: &mut ByteReader<'_>,
+) -> crate::algebra::galois_ring::Result<WhirGrProofHints> {
+    let round_count = reader.read_u64()?;
+    let round_count = usize::try_from(round_count).map_err(|_| {
+        crate::algebra::galois_ring::GrError::ArithmeticOverflow("round hint count")
+    })?;
+    let mut rounds = Vec::with_capacity(round_count);
+    for _ in 0..round_count {
+        let round_bytes = reader.read_bytes()?;
+        rounds.push(deserialize_round_hints(&round_bytes)?);
+    }
+    let final_hint_bytes = reader.read_bytes()?;
+    let final_hint = deserialize_merkle_opening_hint(&final_hint_bytes)?;
+    Ok(WhirGrProofHints {
+        rounds,
+        final_leaf_payloads: final_hint.leaf_payloads,
+    })
+}
+
 fn read_proof(
     ctx: &GrContext,
     reader: &mut ByteReader<'_>,
@@ -456,6 +643,20 @@ fn read_proof(
     })
 }
 
+fn read_magic(
+    reader: &mut ByteReader<'_>,
+    expected: [u8; 8],
+) -> crate::algebra::galois_ring::Result<()> {
+    let magic = reader.read_raw_bytes(expected.len())?;
+    if magic == expected {
+        Ok(())
+    } else {
+        Err(crate::algebra::galois_ring::GrError::InvalidDomain(
+            "WHIR_GR byte stream has an unsupported version marker",
+        ))
+    }
+}
+
 const fn ensure_eof(reader: &ByteReader<'_>) -> crate::algebra::galois_ring::Result<()> {
     if reader.is_empty() {
         Ok(())
@@ -472,13 +673,18 @@ mod tests {
 
     use crate::{
         algebra::galois_ring::{teichmuller_subgroup_generator, Domain, GrConfig, GrContext},
+        hash::Hash,
         protocols::whir_gr::{
-            common::WhirGrPublicParameters,
-            merkle::build_oracle_tree,
+            common::{
+                WhirGrOpening, WhirGrProof, WhirGrProofHints, WhirGrPublicParameters,
+                WhirGrRoundHints, WhirGrRoundProof, WhirGrSumcheckPolynomial,
+            },
+            merkle::{build_oracle_tree, CompactMerkleProof},
             serialization::{
-                deserialize_merkle_proof, deserialize_ring_vector, serialize_domain,
-                serialize_merkle_proof, serialize_public_parameters, serialize_ring_vector,
-                WhirGrOpeningPayload,
+                deserialize_merkle_proof, deserialize_opening, deserialize_ring_vector,
+                serialize_domain, serialize_merkle_proof, serialize_opening,
+                serialize_public_parameters, serialize_ring_vector, WhirGrOpeningHintPayload,
+                WhirGrOpeningPayload, WhirGrOpeningProofPayload,
             },
         },
         transcript::{NargDeserialize, NargSerialize},
@@ -544,12 +750,59 @@ mod tests {
         let ctx = sample_context();
         let values = vec![ctx.one(), ctx.from_u64(2), ctx.from_u64(3), ctx.from_u64(4)];
         let tree = build_oracle_tree(crate::hash::BLAKE3, &ctx, &values).unwrap();
-        let proof = tree.open(&[1, 3]).unwrap();
+        let (proof, hint) = tree.open_compact(&[1, 3]).unwrap();
 
         let encoded = serialize_merkle_proof(&proof);
         let decoded = deserialize_merkle_proof(&encoded).unwrap();
 
         assert_eq!(decoded, proof);
+        assert_eq!(hint.leaf_payloads.len(), proof.queried_indices.len());
+    }
+
+    #[test]
+    fn opening_split_payloads_should_roundtrip() {
+        let ctx = sample_context();
+        let opening = WhirGrOpening {
+            value: ctx.from_u64(7),
+            proof: WhirGrProof {
+                rounds: vec![WhirGrRoundProof {
+                    sumcheck_polynomials: vec![WhirGrSumcheckPolynomial {
+                        coefficients: vec![ctx.one(), ctx.from_u64(2)],
+                    }],
+                    g_root: Hash([3; 32]),
+                    virtual_fold_openings: CompactMerkleProof {
+                        leaf_count: 8,
+                        queried_indices: vec![1, 2],
+                        sibling_hashes: vec![Hash([4; 32]), Hash([5; 32])],
+                    },
+                }],
+                final_constant: ctx.from_u64(9),
+                final_openings: CompactMerkleProof {
+                    leaf_count: 4,
+                    queried_indices: vec![0],
+                    sibling_hashes: vec![Hash([6; 32]), Hash([7; 32])],
+                },
+            },
+            hints: WhirGrProofHints {
+                rounds: vec![WhirGrRoundHints {
+                    virtual_fold_leaf_payloads: vec![vec![11, 12], vec![13, 14]],
+                }],
+                final_leaf_payloads: vec![ctx.serialize(&ctx.from_u64(9))],
+            },
+        };
+
+        let proof_payload = WhirGrOpeningProofPayload::from_opening(&ctx, &opening);
+        let hint_payload = WhirGrOpeningHintPayload::from_opening(&opening);
+        let (value, proof) = proof_payload.into_parts(&ctx).unwrap();
+        let hints = hint_payload.into_hints().unwrap();
+
+        assert_eq!(value, opening.value);
+        assert_eq!(proof, opening.proof);
+        assert_eq!(hints, opening.hints);
+        assert_eq!(
+            deserialize_opening(&ctx, &serialize_opening(&ctx, &opening)).unwrap(),
+            opening
+        );
     }
 
     #[test]

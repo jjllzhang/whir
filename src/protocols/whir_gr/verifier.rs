@@ -4,19 +4,24 @@ use crate::{
     algebra::galois_ring::{Domain, GrContext, GrElem, GrError, Result},
     hash::Hash,
     protocols::whir_gr::{
-        common::{WhirGrCommitment, WhirGrOpening, WhirGrPublicParameters, WhirGrRoundProof},
+        common::{
+            WhirGrCommitment, WhirGrOpening, WhirGrPublicParameters, WhirGrRoundHints,
+            WhirGrRoundProof,
+        },
         constraint::{check_sumcheck_identity, sumcheck_next_sigma, WhirConstraint},
         folding::{
             evaluate_ordered_repeated_ternary_fold_batch_from_values, virtual_fold_query_indices,
             virtual_fold_query_points,
         },
-        merkle::{ByteMerkleTree, MerkleProof},
+        merkle::{ByteMerkleTree, CompactMerkleProof, MerkleOpeningHint},
         multiquadratic::{pow3_checked, pow_m},
         prover::{
             indexed_label, opening_transcript, positions_to_sorted_usize,
             validate_public_parameters,
         },
-        serialization::{serialize_sumcheck_polynomial, WhirGrOpeningPayload},
+        serialization::{
+            serialize_sumcheck_polynomial, WhirGrOpeningHintPayload, WhirGrOpeningProofPayload,
+        },
         transcript::Transcript,
     },
     transcript::{
@@ -96,6 +101,7 @@ impl<'a> WhirGrVerifier<'a> {
                 current_domain: &current_domain,
                 current_root,
                 round,
+                round_hints: &opening.hints.rounds[layer],
             };
             let mut round_state = VerifierRoundState {
                 constraint: &mut constraint,
@@ -138,10 +144,14 @@ impl<'a> WhirGrVerifier<'a> {
         record_elapsed(&mut timings.final_ms, final_start);
 
         let merkle_start = capture_timings.then(Instant::now);
-        if !ByteMerkleTree::verify(
+        let final_hint = MerkleOpeningHint {
+            leaf_payloads: opening.hints.final_leaf_payloads.clone(),
+        };
+        if !ByteMerkleTree::verify_compact(
             self.public_params.hash_id,
             current_root,
             &opening.proof.final_openings,
+            &final_hint,
         )? {
             record_elapsed(&mut timings.merkle_ms, merkle_start);
             return Ok((false, timings));
@@ -149,7 +159,7 @@ impl<'a> WhirGrVerifier<'a> {
         record_elapsed(&mut timings.merkle_ms, merkle_start);
 
         let final_start = capture_timings.then(Instant::now);
-        for payload in &opening.proof.final_openings.leaf_payloads {
+        for payload in &opening.hints.final_leaf_payloads {
             if ctx.deserialize(payload)? != opening.proof.final_constant {
                 record_elapsed(&mut timings.final_ms, final_start);
                 return Ok((false, timings));
@@ -180,12 +190,19 @@ impl<'a> WhirGrVerifier<'a> {
     ) -> VerificationResult<GrElem>
     where
         H: DuplexSpongeInterface,
-        WhirGrOpeningPayload: ProverMessage<[H::U]>,
+        WhirGrOpeningProofPayload: ProverMessage<[H::U]>,
     {
-        let payload: WhirGrOpeningPayload = verifier_state.prover_message()?;
-        let opening = payload
-            .into_opening(&self.public_params.ctx)
+        let proof_payload: WhirGrOpeningProofPayload = verifier_state.prover_message()?;
+        let hint_payload: WhirGrOpeningHintPayload = verifier_state.prover_hint()?;
+        let (value, proof) = proof_payload
+            .into_parts(&self.public_params.ctx)
             .map_err(|_| VerificationError)?;
+        let hints = hint_payload.into_hints().map_err(|_| VerificationError)?;
+        let opening = WhirGrOpening {
+            value,
+            proof,
+            hints,
+        };
         let verified = self
             .verify(commitment, point, &opening)
             .map_err(|_| VerificationError)?;
@@ -203,8 +220,24 @@ impl<'a> WhirGrVerifier<'a> {
         Ok(point.len() == self.public_params.variable_count as usize
             && commitment.oracle_root != Hash::default()
             && opening.proof.rounds.len() == self.public_params.layer_widths.len()
+            && opening.hints.rounds.len() == opening.proof.rounds.len()
             && merkle_shape_valid(&opening.proof.final_openings)
-            && opening.proof.rounds.iter().all(round_shape_valid))
+            && merkle_hint_shape_valid(
+                &opening.proof.final_openings,
+                &opening.hints.final_leaf_payloads,
+            )
+            && opening.proof.rounds.iter().all(round_shape_valid)
+            && opening
+                .proof
+                .rounds
+                .iter()
+                .zip(&opening.hints.rounds)
+                .all(|(round, hints)| {
+                    merkle_hint_shape_valid(
+                        &round.virtual_fold_openings,
+                        &hints.virtual_fold_leaf_payloads,
+                    )
+                }))
     }
 }
 
@@ -220,6 +253,7 @@ struct VerifierRoundInput<'a> {
     current_domain: &'a Domain,
     current_root: Hash,
     round: &'a WhirGrRoundProof,
+    round_hints: &'a WhirGrRoundHints,
 }
 
 struct VerifierRoundState<'a> {
@@ -296,10 +330,14 @@ fn verify_round(
         return Ok(None);
     }
     let merkle_start = capture_timings.then(Instant::now);
-    if !ByteMerkleTree::verify(
+    let virtual_fold_hint = MerkleOpeningHint {
+        leaf_payloads: input.round_hints.virtual_fold_leaf_payloads.clone(),
+    };
+    if !ByteMerkleTree::verify_compact(
         params.hash_id,
         input.current_root,
         &input.round.virtual_fold_openings,
+        &virtual_fold_hint,
     )? {
         record_elapsed(&mut timings.merkle_ms, merkle_start);
         return Ok(None);
@@ -375,6 +413,7 @@ fn check_virtual_fold_queries(
         query_values.push(values_for_indices(
             ctx,
             &input.round.virtual_fold_openings,
+            &input.round_hints.virtual_fold_leaf_payloads,
             indices,
         )?);
         shift_points.push(pow_m(
@@ -398,7 +437,8 @@ fn check_virtual_fold_queries(
 
 fn values_for_indices(
     ctx: &GrContext,
-    proof: &MerkleProof,
+    proof: &CompactMerkleProof,
+    leaf_payloads: &[Vec<u8>],
     indices: &[u64],
 ) -> Result<Vec<GrElem>> {
     let mut values = Vec::with_capacity(indices.len());
@@ -409,7 +449,7 @@ fn values_for_indices(
             .queried_indices
             .binary_search(&index)
             .map_err(|_| GrError::InvalidDomain("missing WHIR_GR Merkle payload for query"))?;
-        values.push(ctx.deserialize(&proof.leaf_payloads[position])?);
+        values.push(ctx.deserialize(&leaf_payloads[position])?);
     }
     Ok(values)
 }
@@ -424,10 +464,17 @@ fn round_shape_valid(round: &WhirGrRoundProof) -> bool {
             .all(|polynomial| !polynomial.coefficients.is_empty())
 }
 
-const fn merkle_shape_valid(proof: &MerkleProof) -> bool {
+fn merkle_shape_valid(proof: &CompactMerkleProof) -> bool {
     proof.leaf_count != 0
         && !proof.queried_indices.is_empty()
-        && proof.queried_indices.len() == proof.leaf_payloads.len()
+        && proof
+            .queried_indices
+            .windows(2)
+            .all(|pair| pair[0] < pair[1])
+}
+
+const fn merkle_hint_shape_valid(proof: &CompactMerkleProof, leaf_payloads: &[Vec<u8>]) -> bool {
+    proof.queried_indices.len() == leaf_payloads.len()
 }
 
 fn record_elapsed(slot: &mut f64, start: Option<Instant>) {

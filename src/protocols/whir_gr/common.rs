@@ -59,18 +59,30 @@ pub struct WhirGrSumcheckPolynomial {
 pub struct WhirGrRoundProof {
     pub sumcheck_polynomials: Vec<WhirGrSumcheckPolynomial>,
     pub g_root: Hash,
-    pub virtual_fold_openings: crate::protocols::whir_gr::merkle::MerkleProof,
+    pub virtual_fold_openings: crate::protocols::whir_gr::merkle::CompactMerkleProof,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WhirGrRoundHints {
+    pub virtual_fold_leaf_payloads: Vec<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WhirGrProof {
     pub rounds: Vec<WhirGrRoundProof>,
     pub final_constant: GrElem,
-    pub final_openings: crate::protocols::whir_gr::merkle::MerkleProof,
+    pub final_openings: crate::protocols::whir_gr::merkle::CompactMerkleProof,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WhirGrProofHints {
+    pub rounds: Vec<WhirGrRoundHints>,
+    pub final_leaf_payloads: Vec<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WhirGrOpening {
     pub value: GrElem,
     pub proof: WhirGrProof,
+    pub hints: WhirGrProofHints,
 }

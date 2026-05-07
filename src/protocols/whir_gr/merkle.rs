@@ -16,11 +16,15 @@ pub struct ByteMerkleTree {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MerkleProof {
+pub struct CompactMerkleProof {
     pub leaf_count: usize,
     pub queried_indices: Vec<usize>,
-    pub leaf_payloads: Vec<Vec<u8>>,
     pub sibling_hashes: Vec<Hash>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MerkleOpeningHint {
+    pub leaf_payloads: Vec<Vec<u8>>,
 }
 
 impl ByteMerkleTree {
@@ -61,37 +65,62 @@ impl ByteMerkleTree {
         self.hash_id
     }
 
-    pub fn open(&self, indices: &[usize]) -> Result<MerkleProof> {
+    pub fn open_compact(
+        &self,
+        indices: &[usize],
+    ) -> Result<(CompactMerkleProof, MerkleOpeningHint)> {
+        if indices.is_empty() {
+            return Err(GrError::InvalidDomain("Merkle opening has no queries"));
+        }
         if indices.iter().any(|&index| index >= self.leaf_count) {
             return Err(GrError::IndexOutOfRange {
                 index: indices.iter().copied().max().unwrap_or(0) as u64,
                 size: self.leaf_count as u64,
             });
         }
+        let queried_indices = canonical_indices(indices);
 
         let sibling_hashes = self
             .config
-            .open_paths(&self.witness, indices)
-            .map_err(|_| GrError::InvalidDomain("failed to open WHIR_GR Merkle paths"))?;
+            .open_compact_paths(&self.witness, &queried_indices)
+            .map_err(|_| GrError::InvalidDomain("failed to open WHIR_GR compact Merkle paths"))?;
 
-        Ok(MerkleProof {
-            leaf_count: self.leaf_count,
-            queried_indices: indices.to_vec(),
-            leaf_payloads: indices
+        let hint = MerkleOpeningHint {
+            leaf_payloads: queried_indices
                 .iter()
                 .map(|&index| self.leaf_payloads[index].clone())
                 .collect(),
-            sibling_hashes,
-        })
+        };
+        Ok((
+            CompactMerkleProof {
+                leaf_count: self.leaf_count,
+                queried_indices,
+                sibling_hashes,
+            },
+            hint,
+        ))
     }
 
-    pub fn verify(hash_id: EngineId, root: Hash, proof: &MerkleProof) -> Result<bool> {
+    pub fn verify_compact(
+        hash_id: EngineId,
+        root: Hash,
+        proof: &CompactMerkleProof,
+        hint: &MerkleOpeningHint,
+    ) -> Result<bool> {
         if proof.leaf_count == 0 {
             return Err(GrError::InvalidDomain("Merkle proof leaf count is zero"));
         }
-        if proof.queried_indices.len() != proof.leaf_payloads.len() {
+        if proof.queried_indices.is_empty() {
+            return Err(GrError::InvalidDomain("Merkle proof has no queries"));
+        }
+        if proof.queried_indices.len() != hint.leaf_payloads.len() {
             return Err(GrError::InvalidDomain(
                 "Merkle proof index/payload length mismatch",
+            ));
+        }
+        if !is_strictly_sorted(&proof.queried_indices) {
+            return Err(GrError::InvalidDomain(
+                "Merkle proof query indices must be strictly sorted",
             ));
         }
         if proof
@@ -105,27 +134,15 @@ impl ByteMerkleTree {
             });
         }
 
-        let depth = proof.leaf_count.next_power_of_two().ilog2() as usize;
-        if proof.sibling_hashes.len() != proof.queried_indices.len() * depth {
-            return Err(GrError::InvalidDomain(
-                "Merkle proof sibling count mismatch",
-            ));
-        }
-
-        if ENGINES.retrieve(hash_id).is_none() {
-            return Err(GrError::InvalidDomain(
-                "WHIR_GR hash engine is not registered",
-            ));
-        }
         let config = merkle_tree::Config::with_hash(hash_id, proof.leaf_count);
         let commitment = merkle_tree::Commitment::new(root);
-        let leaf_hashes = proof
+        let leaf_hashes = hint
             .leaf_payloads
             .iter()
             .map(|payload| hash_leaf(hash_id, payload))
             .collect::<Result<Vec<_>>>()?;
         Ok(config
-            .verify_paths(
+            .verify_compact_paths(
                 &commitment,
                 &proof.queried_indices,
                 &leaf_hashes,
@@ -133,6 +150,17 @@ impl ByteMerkleTree {
             )
             .is_ok())
     }
+}
+
+fn canonical_indices(indices: &[usize]) -> Vec<usize> {
+    let mut indices = indices.to_vec();
+    indices.sort_unstable();
+    indices.dedup();
+    indices
+}
+
+fn is_strictly_sorted(indices: &[usize]) -> bool {
+    indices.windows(2).all(|pair| pair[0] < pair[1])
 }
 
 pub fn build_oracle_leaves(ctx: &GrContext, oracle_evals: &[GrElem]) -> Vec<Vec<u8>> {
@@ -230,10 +258,10 @@ mod tests {
         let values = vec![ctx.one(), ctx.from_u64(2), ctx.from_u64(3), ctx.from_u64(4)];
         let tree = build_oracle_tree(BLAKE3, &ctx, &values).unwrap();
 
-        let proof = tree.open(&[1, 3]).unwrap();
+        let (proof, hint) = tree.open_compact(&[1, 3]).unwrap();
 
-        assert!(ByteMerkleTree::verify(BLAKE3, tree.root(), &proof).unwrap());
-        assert!(!ByteMerkleTree::verify(SHA2, tree.root(), &proof).unwrap());
+        assert!(ByteMerkleTree::verify_compact(BLAKE3, tree.root(), &proof, &hint).unwrap());
+        assert!(!ByteMerkleTree::verify_compact(SHA2, tree.root(), &proof, &hint).unwrap());
     }
 
     #[test]
@@ -241,9 +269,9 @@ mod tests {
         let ctx = sample_context();
         let values = vec![ctx.one(), ctx.from_u64(2), ctx.from_u64(3), ctx.from_u64(4)];
         let tree = build_oracle_tree(BLAKE3, &ctx, &values).unwrap();
-        let mut proof = tree.open(&[1]).unwrap();
-        proof.leaf_payloads[0][0] ^= 1;
+        let (proof, mut hint) = tree.open_compact(&[1]).unwrap();
+        hint.leaf_payloads[0][0] ^= 1;
 
-        assert!(!ByteMerkleTree::verify(BLAKE3, tree.root(), &proof).unwrap());
+        assert!(!ByteMerkleTree::verify_compact(BLAKE3, tree.root(), &proof, &hint).unwrap());
     }
 }

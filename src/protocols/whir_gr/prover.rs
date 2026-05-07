@@ -9,7 +9,8 @@ use crate::{
     hash::Hash,
     protocols::whir_gr::{
         common::{
-            WhirGrCommitment, WhirGrOpening, WhirGrProof, WhirGrPublicParameters, WhirGrRoundProof,
+            WhirGrCommitment, WhirGrOpening, WhirGrProof, WhirGrProofHints, WhirGrPublicParameters,
+            WhirGrRoundHints, WhirGrRoundProof,
         },
         constraint::{
             honest_sumcheck_polynomial_for_restricted, sumcheck_next_sigma, WhirConstraint,
@@ -25,11 +26,11 @@ use crate::{
         oracle_encoding::rs_encode_teichmuller_coset,
         serialization::{
             serialize_public_parameters, serialize_ring_vector, serialize_sumcheck_polynomial,
-            WhirGrOpeningPayload,
+            WhirGrOpeningHintPayload, WhirGrOpeningProofPayload,
         },
         transcript::Transcript,
     },
-    transcript::{DuplexSpongeInterface, ProverMessage, ProverState},
+    transcript::{DuplexSpongeInterface, NargSerialize, ProverMessage, ProverState},
 };
 
 #[derive(Clone, Debug)]
@@ -279,7 +280,7 @@ impl<'a> WhirGrProver<'a> {
         record_elapsed(&mut timings.init_ms, init_start);
 
         let merkle_open_start = capture_timings.then(Instant::now);
-        let final_openings = current_tree.open(&[0])?;
+        let (final_openings, final_opening_hint) = current_tree.open_compact(&[0])?;
         record_elapsed(&mut timings.merkle_open_ms, merkle_open_start);
 
         let mut opening = WhirGrOpening {
@@ -288,6 +289,10 @@ impl<'a> WhirGrProver<'a> {
                 rounds: Vec::with_capacity(self.public_params.layer_widths.len()),
                 final_constant: ctx.zero(),
                 final_openings,
+            },
+            hints: WhirGrProofHints {
+                rounds: Vec::with_capacity(self.public_params.layer_widths.len()),
+                final_leaf_payloads: final_opening_hint.leaf_payloads,
             },
         };
 
@@ -300,7 +305,7 @@ impl<'a> WhirGrProver<'a> {
                 constraint: &mut constraint,
                 sigma: &mut sigma,
             };
-            let round = prove_round(
+            let (round, round_hints) = prove_round(
                 self.public_params,
                 &mut transcript,
                 layer as u64,
@@ -310,6 +315,7 @@ impl<'a> WhirGrProver<'a> {
                 capture_timings,
             )?;
             opening.proof.rounds.push(round);
+            opening.hints.rounds.push(round_hints);
         }
 
         let final_start = capture_timings.then(Instant::now);
@@ -323,10 +329,11 @@ impl<'a> WhirGrProver<'a> {
         record_elapsed(&mut timings.final_ms, final_start);
 
         let merkle_open_start = capture_timings.then(Instant::now);
-        opening.proof.final_openings = current_tree.open(&positions_to_sorted_usize(
-            final_positions,
-            current_domain.size(),
-        )?)?;
+        let (final_openings, final_opening_hint) = current_tree.open_compact(
+            &positions_to_sorted_usize(final_positions, current_domain.size())?,
+        )?;
+        opening.proof.final_openings = final_openings;
+        opening.hints.final_leaf_payloads = final_opening_hint.leaf_payloads;
         record_elapsed(&mut timings.merkle_open_ms, merkle_open_start);
         Ok((opening, timings))
     }
@@ -341,14 +348,16 @@ impl<'a> WhirGrProver<'a> {
     where
         H: DuplexSpongeInterface,
         R: RngCore + CryptoRng,
-        WhirGrOpeningPayload: ProverMessage<[H::U]>,
+        WhirGrOpeningProofPayload: ProverMessage<[H::U]>,
+        WhirGrOpeningHintPayload: NargSerialize,
     {
         let opening = self.open(commitment, state, point)?;
         let value = opening.value.clone();
-        prover_state.prover_message(&WhirGrOpeningPayload::from_opening(
+        prover_state.prover_message(&WhirGrOpeningProofPayload::from_opening(
             &self.public_params.ctx,
             &opening,
         ));
+        prover_state.prover_hint(&WhirGrOpeningHintPayload::from_opening(&opening));
         Ok(value)
     }
 }
@@ -361,15 +370,18 @@ fn prove_round(
     state: &mut ProverRoundState<'_>,
     timings: &mut WhirGrOpenTimings,
     capture_timings: bool,
-) -> Result<WhirGrRoundProof> {
+) -> Result<(WhirGrRoundProof, WhirGrRoundHints)> {
     let ctx = &params.ctx;
     let merkle_open_start = capture_timings.then(Instant::now);
-    let virtual_fold_openings = state.tree.open(&[0])?;
+    let (virtual_fold_openings, virtual_fold_hint) = state.tree.open_compact(&[0])?;
     record_elapsed(&mut timings.merkle_open_ms, merkle_open_start);
     let mut round = WhirGrRoundProof {
         sumcheck_polynomials: Vec::with_capacity(width as usize),
         g_root: Hash::default(),
         virtual_fold_openings,
+    };
+    let mut round_hints = WhirGrRoundHints {
+        virtual_fold_leaf_payloads: virtual_fold_hint.leaf_payloads,
     };
 
     let mut alphas = Vec::with_capacity(width as usize);
@@ -439,10 +451,11 @@ fn prove_round(
     record_elapsed(&mut timings.fold_ms, fold_start);
 
     let merkle_open_start = capture_timings.then(Instant::now);
-    round.virtual_fold_openings = state.tree.open(&positions_to_sorted_usize(
-        shift_data.parent_indices,
-        state.domain.size(),
-    )?)?;
+    let (virtual_fold_openings, virtual_fold_hint) = state.tree.open_compact(
+        &positions_to_sorted_usize(shift_data.parent_indices, state.domain.size())?,
+    )?;
+    round.virtual_fold_openings = virtual_fold_openings;
+    round_hints.virtual_fold_leaf_payloads = virtual_fold_hint.leaf_payloads;
     record_elapsed(&mut timings.merkle_open_ms, merkle_open_start);
 
     let constraint_start = capture_timings.then(Instant::now);
@@ -462,7 +475,7 @@ fn prove_round(
     *state.oracle = next_oracle;
     *state.tree = next_tree;
     *state.constraint = next_constraint;
-    Ok(round)
+    Ok((round, round_hints))
 }
 
 fn shift_query_data(
