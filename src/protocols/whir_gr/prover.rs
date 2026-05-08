@@ -112,6 +112,23 @@ impl<'a> WhirGrProver<'a> {
         &self,
         polynomial: &MultiQuadraticPolynomial,
     ) -> Result<(WhirGrCommitment, WhirGrCommitmentState)> {
+        let (commitment, state, _timings) = self.commit_impl(polynomial, false)?;
+        Ok((commitment, state))
+    }
+
+    #[doc(hidden)]
+    pub fn commit_profiled(
+        &self,
+        polynomial: &MultiQuadraticPolynomial,
+    ) -> Result<(WhirGrCommitment, WhirGrCommitmentState, WhirGrCommitTimings)> {
+        self.commit_impl(polynomial, true)
+    }
+
+    fn commit_impl(
+        &self,
+        polynomial: &MultiQuadraticPolynomial,
+        capture_timings: bool,
+    ) -> Result<(WhirGrCommitment, WhirGrCommitmentState, WhirGrCommitTimings)> {
         validate_public_parameters(self.public_params)?;
         if polynomial.variable_count() != self.public_params.variable_count {
             return Err(GrError::InvalidPolynomial(
@@ -119,16 +136,21 @@ impl<'a> WhirGrProver<'a> {
             ));
         }
 
+        let mut timings = WhirGrCommitTimings::default();
+        let encode_start = capture_timings.then(Instant::now);
         let initial_oracle = encode_oracle(
             self.public_params,
             &self.public_params.initial_domain,
             polynomial,
         )?;
+        record_elapsed(&mut timings.encode_oracle_ms, encode_start);
+        let merkle_start = capture_timings.then(Instant::now);
         let initial_tree = build_oracle_tree(
             self.public_params.hash_id,
             &self.public_params.ctx,
             &initial_oracle,
         )?;
+        record_elapsed(&mut timings.merkle_ms, merkle_start);
         let oracle_root = initial_tree.root();
         let commitment = WhirGrCommitment { oracle_root };
         let state = WhirGrCommitmentState {
@@ -138,7 +160,7 @@ impl<'a> WhirGrProver<'a> {
             initial_oracle,
             oracle_root,
         };
-        Ok((commitment, state))
+        Ok((commitment, state, timings))
     }
 
     pub fn commit_transcript<H, R>(

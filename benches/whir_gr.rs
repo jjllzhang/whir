@@ -6,7 +6,9 @@ use std::{
 use divan::{black_box, AllocProfiler, Bencher};
 use whir::protocols::whir_gr::{
     bench_support::{
-        commit_input, open_input, verify_input, WhirGrBenchCase, WHIR_GR_CASES, WHIR_GR_SMALL_CASES,
+        commit_bench_polynomial, commit_input, open_input, verify_input, WhirGrBenchCase,
+        WHIR_GR_CASES, WHIR_GR_MULTIQUADRATIC_CASES, WHIR_GR_MULTIQUADRATIC_SMALL_CASES,
+        WHIR_GR_SMALL_CASES,
     },
     common::WhirGrOpening,
     prover::WhirGrProver,
@@ -24,8 +26,28 @@ fn whir_gr_commit_small(bencher: Bencher, case: &WhirGrBenchCase) {
     bench_commit(bencher, case);
 }
 
+#[divan::bench(
+    args = WHIR_GR_MULTIQUADRATIC_SMALL_CASES,
+    sample_count = 1,
+    sample_size = 1,
+    ignore
+)]
+fn whir_gr_commit_multiquadratic_small(bencher: Bencher, case: &WhirGrBenchCase) {
+    bench_commit(bencher, case);
+}
+
 #[divan::bench(args = WHIR_GR_CASES, sample_count = 1, sample_size = 1, ignore)]
 fn whir_gr_commit(bencher: Bencher, case: &WhirGrBenchCase) {
+    bench_commit(bencher, case);
+}
+
+#[divan::bench(
+    args = WHIR_GR_MULTIQUADRATIC_CASES,
+    sample_count = 1,
+    sample_size = 1,
+    ignore
+)]
+fn whir_gr_commit_multiquadratic(bencher: Bencher, case: &WhirGrBenchCase) {
     bench_commit(bencher, case);
 }
 
@@ -34,8 +56,7 @@ fn bench_commit(bencher: Bencher, case: &WhirGrBenchCase) {
         .with_inputs(|| commit_input(case).unwrap_or_else(|error| panic!("{error}")))
         .bench_values(|input| {
             let prover = WhirGrProver::new(&input.params);
-            let (commitment, state) = prover
-                .commit_multilinear(&input.polynomial)
+            let (commitment, state) = commit_bench_polynomial(&prover, &input.polynomial)
                 .unwrap_or_else(|error| panic!("{error}"));
             black_box((commitment, state));
         });
@@ -43,6 +64,20 @@ fn bench_commit(bencher: Bencher, case: &WhirGrBenchCase) {
 
 #[divan::bench(args = WHIR_GR_CASES, sample_count = 1, sample_size = 1, ignore)]
 fn whir_gr_open(bencher: Bencher, case: &WhirGrBenchCase) {
+    bench_open(bencher, case);
+}
+
+#[divan::bench(
+    args = WHIR_GR_MULTIQUADRATIC_CASES,
+    sample_count = 1,
+    sample_size = 1,
+    ignore
+)]
+fn whir_gr_open_multiquadratic(bencher: Bencher, case: &WhirGrBenchCase) {
+    bench_open(bencher, case);
+}
+
+fn bench_open(bencher: Bencher, case: &WhirGrBenchCase) {
     bencher
         .with_inputs(|| open_input(case).unwrap_or_else(|error| panic!("{error}")))
         .bench_values(|input| {
@@ -125,6 +160,20 @@ fn print_proof_size_once(
 
 #[divan::bench(args = WHIR_GR_CASES, sample_count = 1, sample_size = 1, ignore)]
 fn whir_gr_verify(bencher: Bencher, case: &WhirGrBenchCase) {
+    bench_verify(bencher, case);
+}
+
+#[divan::bench(
+    args = WHIR_GR_MULTIQUADRATIC_CASES,
+    sample_count = 1,
+    sample_size = 1,
+    ignore
+)]
+fn whir_gr_verify_multiquadratic(bencher: Bencher, case: &WhirGrBenchCase) {
+    bench_verify(bencher, case);
+}
+
+fn bench_verify(bencher: Bencher, case: &WhirGrBenchCase) {
     bencher
         .with_inputs(|| verify_input(case).unwrap_or_else(|error| panic!("{error}")))
         .bench_values(|input| {

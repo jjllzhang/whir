@@ -3,7 +3,10 @@ use std::{error::Error, time::Instant};
 use clap::{Parser, ValueEnum};
 use serde_json::json;
 use whir::protocols::whir_gr::{
-    bench_support::{commit_input, find_case, open_input, verify_input, WhirGrBenchCase},
+    bench_support::{
+        commit_bench_polynomial_profiled, commit_input, find_case, find_case_with_polynomial,
+        open_input, verify_input, WhirGrBenchCase, WhirGrPolynomialKind,
+    },
     prover::{WhirGrCommitTimings, WhirGrOpenTimings, WhirGrProver},
     serialization::serialize_opening,
     verifier::{WhirGrVerifier, WhirGrVerifyTimings},
@@ -22,12 +25,30 @@ enum OutputFormat {
     Csv,
     Text,
     Json,
+    SummaryCsv,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum PolynomialKindArg {
+    Multilinear,
+    Multiquadratic,
+}
+
+impl From<PolynomialKindArg> for WhirGrPolynomialKind {
+    fn from(value: PolynomialKindArg) -> Self {
+        match value {
+            PolynomialKindArg::Multilinear => Self::Multilinear,
+            PolynomialKindArg::Multiquadratic => Self::MultiQuadratic,
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
 struct Args {
     #[arg(long = "case")]
     case_name: String,
+    #[arg(long, value_enum)]
+    polynomial: Option<PolynomialKindArg>,
     #[arg(long, value_enum)]
     phase: ProfilePhase,
     #[arg(long, default_value_t = 1)]
@@ -200,8 +221,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         );
     }
 
-    let case = find_case(&args.case_name)
-        .ok_or_else(|| format!("unknown WHIR_GR bench case '{}'", args.case_name))?;
+    let case = find_profile_case(&args)?;
     let row = match args.phase {
         ProfilePhase::Commit => profile_commit(case, args.reps)?,
         ProfilePhase::Open => profile_open(case, args.reps)?,
@@ -210,6 +230,23 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     write_row(&args, case, &row);
     Ok(())
+}
+
+fn find_profile_case(args: &Args) -> Result<&'static WhirGrBenchCase, Box<dyn Error>> {
+    if let Some(polynomial_kind) = args.polynomial {
+        return find_case_with_polynomial(&args.case_name, polynomial_kind.into()).ok_or_else(
+            || {
+                format!(
+                    "unknown WHIR_GR {:?} bench case '{}'",
+                    polynomial_kind, args.case_name
+                )
+                .into()
+            },
+        );
+    }
+
+    find_case(&args.case_name)
+        .ok_or_else(|| format!("unknown WHIR_GR bench case '{}'", args.case_name).into())
 }
 
 fn profile_commit(case: &WhirGrBenchCase, reps: u64) -> Result<ProfileRow, Box<dyn Error>> {
@@ -221,7 +258,7 @@ fn profile_commit(case: &WhirGrBenchCase, reps: u64) -> Result<ProfileRow, Box<d
     let start = Instant::now();
     for _ in 0..reps {
         let (_commitment, _state, timings) =
-            prover.commit_multilinear_profiled(&input.polynomial)?;
+            commit_bench_polynomial_profiled(&prover, &input.polynomial)?;
         encode_oracle_ms += timings.encode_oracle_ms;
         merkle_ms += timings.merkle_ms;
         to_multiquadratic_ms += timings.to_multiquadratic_ms;
@@ -361,7 +398,8 @@ fn profile_roundtrip(case: &WhirGrBenchCase, reps: u64) -> Result<ProfileRow, Bo
 
     for _ in 0..reps {
         let start = Instant::now();
-        let (commitment, state, timings) = prover.commit_multilinear_profiled(&input.polynomial)?;
+        let (commitment, state, timings) =
+            commit_bench_polynomial_profiled(&prover, &input.polynomial)?;
         totals.add_commit(elapsed_ms(start), &timings);
 
         let start = Instant::now();
@@ -401,6 +439,7 @@ fn write_row(args: &Args, case: &WhirGrBenchCase, row: &ProfileRow) {
         OutputFormat::Csv => write_csv(args, case, row),
         OutputFormat::Text => write_text(args, case, row),
         OutputFormat::Json => write_json(args, case, row),
+        OutputFormat::SummaryCsv => write_summary_csv(case, row),
     }
 }
 
@@ -450,6 +489,37 @@ fn write_csv(args: &Args, case: &WhirGrBenchCase, row: &ProfileRow) {
         fmt_optional_f64(row.verify_final_ms),
         fmt_optional_usize(row.serialized_opening_bytes),
         fmt_optional_bool(row.accepted),
+    ];
+    println!("{}", fields.join(","));
+}
+
+fn write_summary_csv(case: &WhirGrBenchCase, row: &ProfileRow) {
+    println!(
+        "case,ring,k_exp,r,lambda_target,variable_count,max_layer_width,poly_dim,message_length,n_0,rho,commit_ms,open_ms,prove_ms,verify_ms,proof_size_bytes,proof_size_kb"
+    );
+    let message_length = pow_u64(3, case.variable_count);
+    let proof_size_kb = row
+        .serialized_opening_bytes
+        .map(|bytes| format!("{:.3}", bytes as f64 / 1024.0))
+        .unwrap_or_default();
+    let fields = [
+        case.name.to_string(),
+        format!("\"GR(2^{},{})\"", case.k_exp, case.r),
+        case.k_exp.to_string(),
+        case.r.to_string(),
+        case.lambda_target.to_string(),
+        case.variable_count.to_string(),
+        case.max_layer_width.to_string(),
+        source_coefficient_count(case).to_string(),
+        message_length.to_string(),
+        case.n.to_string(),
+        reduced_fraction(message_length, case.n),
+        fmt_optional_f64(row.commit_ms),
+        fmt_optional_f64(row.open_ms),
+        fmt_optional_f64(sum_options(row.commit_ms, row.open_ms)),
+        fmt_optional_f64(row.verify_ms),
+        fmt_optional_usize(row.serialized_opening_bytes),
+        proof_size_kb,
     ];
     println!("{}", fields.join(","));
 }
@@ -579,4 +649,37 @@ fn fmt_optional_usize(value: Option<usize>) -> String {
 
 fn fmt_optional_bool(value: Option<bool>) -> String {
     value.map(|value| value.to_string()).unwrap_or_default()
+}
+
+fn source_coefficient_count(case: &WhirGrBenchCase) -> u64 {
+    match case.polynomial_kind {
+        WhirGrPolynomialKind::Multilinear => pow_u64(2, case.variable_count),
+        WhirGrPolynomialKind::MultiQuadratic => pow_u64(3, case.variable_count),
+    }
+}
+
+fn pow_u64(base: u64, exponent: u64) -> u64 {
+    let mut out = 1;
+    for _ in 0..exponent {
+        out *= base;
+    }
+    out
+}
+
+fn reduced_fraction(numerator: u64, denominator: u64) -> String {
+    let divisor = gcd(numerator, denominator);
+    format!("{}/{}", numerator / divisor, denominator / divisor)
+}
+
+const fn gcd(mut left: u64, mut right: u64) -> u64 {
+    while right != 0 {
+        let next = left % right;
+        left = right;
+        right = next;
+    }
+    left
+}
+
+fn sum_options(left: Option<f64>, right: Option<f64>) -> Option<f64> {
+    Some(left? + right?)
 }
