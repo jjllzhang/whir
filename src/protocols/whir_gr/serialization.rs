@@ -11,9 +11,9 @@ use crate::{
     transcript::{Encoding, NargDeserialize, VerificationError, VerificationResult},
 };
 
-const OPENING_V2_MAGIC: [u8; 8] = *b"WGRPOV2\0";
-const OPENING_PROOF_V2_MAGIC: [u8; 8] = *b"WGRPPV2\0";
-const OPENING_HINT_V2_MAGIC: [u8; 8] = *b"WGRPHV2\0";
+const OPENING_V3_MAGIC: [u8; 8] = *b"WGRPOV3\0";
+const OPENING_PROOF_V3_MAGIC: [u8; 8] = *b"WGRPPV3\0";
+const OPENING_HINT_V3_MAGIC: [u8; 8] = *b"WGRPHV3\0";
 
 #[derive(Clone, Debug, Default)]
 pub struct ByteWriter {
@@ -316,6 +316,7 @@ pub fn serialize_public_parameters(params: &WhirGrPublicParameters) -> Vec<u8> {
     writer.write_raw_bytes(params.hash_id.as_slice());
     writer.write_u64_vector(&params.layer_widths);
     writer.write_u64_vector(&params.shift_repetitions);
+    writer.write_u64_vector(&params.ood_samples_per_round);
     writer.write_u64(params.final_repetitions);
     writer.write_u64_vector(&params.degree_bounds);
     writer.into_bytes()
@@ -358,6 +359,7 @@ pub fn serialize_round_proof(ctx: &GrContext, proof: &WhirGrRoundProof) -> Vec<u
         writer.write_bytes(&serialize_sumcheck_polynomial(ctx, polynomial));
     }
     writer.write_hash(&proof.g_root);
+    writer.write_ring_vector(ctx, &proof.ood_answers);
     writer.write_bytes(&serialize_merkle_proof(&proof.virtual_fold_openings));
     writer.into_bytes()
 }
@@ -393,7 +395,7 @@ pub fn serialize_hints(hints: &WhirGrProofHints) -> Vec<u8> {
 
 pub fn serialize_opening_proof(ctx: &GrContext, opening: &WhirGrOpening) -> Vec<u8> {
     let mut writer = ByteWriter::new();
-    writer.write_raw_bytes(&OPENING_PROOF_V2_MAGIC);
+    writer.write_raw_bytes(&OPENING_PROOF_V3_MAGIC);
     writer.write_ring_element(ctx, &opening.value);
     writer.write_bytes(&serialize_proof(ctx, &opening.proof));
     writer.into_bytes()
@@ -401,14 +403,14 @@ pub fn serialize_opening_proof(ctx: &GrContext, opening: &WhirGrOpening) -> Vec<
 
 pub fn serialize_opening_hints(hints: &WhirGrProofHints) -> Vec<u8> {
     let mut writer = ByteWriter::new();
-    writer.write_raw_bytes(&OPENING_HINT_V2_MAGIC);
+    writer.write_raw_bytes(&OPENING_HINT_V3_MAGIC);
     writer.write_bytes(&serialize_hints(hints));
     writer.into_bytes()
 }
 
 pub fn serialize_opening(ctx: &GrContext, opening: &WhirGrOpening) -> Vec<u8> {
     let mut writer = ByteWriter::new();
-    writer.write_raw_bytes(&OPENING_V2_MAGIC);
+    writer.write_raw_bytes(&OPENING_V3_MAGIC);
     writer.write_ring_element(ctx, &opening.value);
     writer.write_bytes(&serialize_proof(ctx, &opening.proof));
     writer.write_bytes(&serialize_hints(&opening.hints));
@@ -502,7 +504,7 @@ pub fn deserialize_opening_proof(
     bytes: &[u8],
 ) -> crate::algebra::galois_ring::Result<(GrElem, WhirGrProof)> {
     let mut reader = ByteReader::new(bytes);
-    read_magic(&mut reader, OPENING_PROOF_V2_MAGIC)?;
+    read_magic(&mut reader, OPENING_PROOF_V3_MAGIC)?;
     let value = reader.read_ring_element(ctx)?;
     let proof_bytes = reader.read_bytes()?;
     let proof = deserialize_proof(ctx, &proof_bytes)?;
@@ -514,7 +516,7 @@ pub fn deserialize_opening_hints(
     bytes: &[u8],
 ) -> crate::algebra::galois_ring::Result<WhirGrProofHints> {
     let mut reader = ByteReader::new(bytes);
-    read_magic(&mut reader, OPENING_HINT_V2_MAGIC)?;
+    read_magic(&mut reader, OPENING_HINT_V3_MAGIC)?;
     let hint_bytes = reader.read_bytes()?;
     let hints = deserialize_hints(&hint_bytes)?;
     ensure_eof(&reader)?;
@@ -526,7 +528,7 @@ pub fn deserialize_opening(
     bytes: &[u8],
 ) -> crate::algebra::galois_ring::Result<WhirGrOpening> {
     let mut reader = ByteReader::new(bytes);
-    read_magic(&mut reader, OPENING_V2_MAGIC)?;
+    read_magic(&mut reader, OPENING_V3_MAGIC)?;
     let value = reader.read_ring_element(ctx)?;
     let proof_bytes = reader.read_bytes()?;
     let proof = deserialize_proof(ctx, &proof_bytes)?;
@@ -592,11 +594,13 @@ fn read_round_proof(
         sumcheck_polynomials.push(deserialize_sumcheck_polynomial(ctx, &polynomial_bytes)?);
     }
     let g_root = reader.read_hash()?;
+    let ood_answers = reader.read_ring_vector(ctx)?;
     let virtual_fold_bytes = reader.read_bytes()?;
     let virtual_fold_openings = deserialize_merkle_proof(&virtual_fold_bytes)?;
     Ok(WhirGrRoundProof {
         sumcheck_polynomials,
         g_root,
+        ood_answers,
         virtual_fold_openings,
     })
 }
@@ -770,6 +774,7 @@ mod tests {
                         coefficients: vec![ctx.one(), ctx.from_u64(2)],
                     }],
                     g_root: Hash([3; 32]),
+                    ood_answers: vec![ctx.from_u64(17)],
                     virtual_fold_openings: CompactMerkleProof {
                         leaf_count: 8,
                         queried_indices: vec![1, 2],

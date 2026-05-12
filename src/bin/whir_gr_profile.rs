@@ -1,11 +1,14 @@
+#![recursion_limit = "256"]
+
 use std::{error::Error, time::Instant};
 
 use clap::{Parser, ValueEnum};
 use serde_json::json;
 use whir::protocols::whir_gr::{
     bench_support::{
-        commit_bench_polynomial_profiled, commit_input, find_case, find_case_with_polynomial,
-        open_input, verify_input, WhirGrBenchCase, WhirGrPolynomialKind,
+        commit_bench_polynomial_profiled, commit_input_with_ood, find_case,
+        find_case_with_polynomial, open_input_with_ood, verify_input_with_ood, WhirGrBenchCase,
+        WhirGrPolynomialKind,
     },
     prover::{WhirGrCommitTimings, WhirGrOpenTimings, WhirGrProver},
     serialization::serialize_opening,
@@ -57,6 +60,8 @@ struct Args {
     allocator_stats: bool,
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
+    #[arg(long, default_value_t = 0)]
+    ood_samples_per_round: u64,
 }
 
 #[derive(Default)]
@@ -223,10 +228,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let case = find_profile_case(&args)?;
     let row = match args.phase {
-        ProfilePhase::Commit => profile_commit(case, args.reps)?,
-        ProfilePhase::Open => profile_open(case, args.reps)?,
-        ProfilePhase::Verify => profile_verify(case, args.reps)?,
-        ProfilePhase::Roundtrip => profile_roundtrip(case, args.reps)?,
+        ProfilePhase::Commit => profile_commit(case, args.reps, args.ood_samples_per_round)?,
+        ProfilePhase::Open => profile_open(case, args.reps, args.ood_samples_per_round)?,
+        ProfilePhase::Verify => profile_verify(case, args.reps, args.ood_samples_per_round)?,
+        ProfilePhase::Roundtrip => profile_roundtrip(case, args.reps, args.ood_samples_per_round)?,
     };
     write_row(&args, case, &row);
     Ok(())
@@ -249,8 +254,12 @@ fn find_profile_case(args: &Args) -> Result<&'static WhirGrBenchCase, Box<dyn Er
         .ok_or_else(|| format!("unknown WHIR_GR bench case '{}'", args.case_name).into())
 }
 
-fn profile_commit(case: &WhirGrBenchCase, reps: u64) -> Result<ProfileRow, Box<dyn Error>> {
-    let input = commit_input(case)?;
+fn profile_commit(
+    case: &WhirGrBenchCase,
+    reps: u64,
+    ood_samples_per_round: u64,
+) -> Result<ProfileRow, Box<dyn Error>> {
+    let input = commit_input_with_ood(case, ood_samples_per_round)?;
     let prover = WhirGrProver::new(&input.params);
     let mut encode_oracle_ms = 0.0;
     let mut merkle_ms = 0.0;
@@ -273,8 +282,12 @@ fn profile_commit(case: &WhirGrBenchCase, reps: u64) -> Result<ProfileRow, Box<d
     })
 }
 
-fn profile_open(case: &WhirGrBenchCase, reps: u64) -> Result<ProfileRow, Box<dyn Error>> {
-    let input = open_input(case)?;
+fn profile_open(
+    case: &WhirGrBenchCase,
+    reps: u64,
+    ood_samples_per_round: u64,
+) -> Result<ProfileRow, Box<dyn Error>> {
+    let input = open_input_with_ood(case, ood_samples_per_round)?;
     let prover = WhirGrProver::new(&input.params);
     let mut serialized_opening_bytes = None;
     let mut clone_ms = 0.0;
@@ -345,8 +358,12 @@ fn profile_open(case: &WhirGrBenchCase, reps: u64) -> Result<ProfileRow, Box<dyn
     })
 }
 
-fn profile_verify(case: &WhirGrBenchCase, reps: u64) -> Result<ProfileRow, Box<dyn Error>> {
-    let input = verify_input(case)?;
+fn profile_verify(
+    case: &WhirGrBenchCase,
+    reps: u64,
+    ood_samples_per_round: u64,
+) -> Result<ProfileRow, Box<dyn Error>> {
+    let input = verify_input_with_ood(case, ood_samples_per_round)?;
     let verifier = WhirGrVerifier::new(&input.params);
     let serialized_opening_bytes = serialize_opening(&input.params.ctx, &input.opening).len();
     let mut accepted = true;
@@ -382,8 +399,12 @@ fn profile_verify(case: &WhirGrBenchCase, reps: u64) -> Result<ProfileRow, Box<d
     })
 }
 
-fn profile_roundtrip(case: &WhirGrBenchCase, reps: u64) -> Result<ProfileRow, Box<dyn Error>> {
-    let input = commit_input(case)?;
+fn profile_roundtrip(
+    case: &WhirGrBenchCase,
+    reps: u64,
+    ood_samples_per_round: u64,
+) -> Result<ProfileRow, Box<dyn Error>> {
+    let input = commit_input_with_ood(case, ood_samples_per_round)?;
     let point = whir::protocols::whir_gr::bench_support::open_point(
         &input.params.ctx,
         case.variable_count,
@@ -439,16 +460,18 @@ fn write_row(args: &Args, case: &WhirGrBenchCase, row: &ProfileRow) {
         OutputFormat::Csv => write_csv(args, case, row),
         OutputFormat::Text => write_text(args, case, row),
         OutputFormat::Json => write_json(args, case, row),
-        OutputFormat::SummaryCsv => write_summary_csv(case, row),
+        OutputFormat::SummaryCsv => write_summary_csv(args, case, row),
     }
 }
 
 fn write_csv(args: &Args, case: &WhirGrBenchCase, row: &ProfileRow) {
     println!(
-        "case,k_exp,r,n,variable_count,max_layer_width,lambda_target,rho0,phase,reps,rayon_threads,commit_ms,open_ms,verify_ms,encode_oracle_ms,merkle_ms,to_multiquadratic_ms,open_fold_ms,open_fold_indices_ms,open_fold_eval_ms,open_fold_shift_points_ms,open_clone_ms,open_init_ms,open_sumcheck_ms,open_sumcheck_constraint_plan_ms,open_sumcheck_poly_restrict_ms,open_sumcheck_poly_eval_ms,open_sumcheck_accumulate_ms,open_sumcheck_interpolate_ms,open_restrict_ms,open_merkle_open_ms,open_constraint_ms,open_final_ms,verify_algebra_ms,verify_sumcheck_ms,verify_merkle_ms,verify_fold_ms,verify_constraint_ms,verify_final_ms,serialized_opening_bytes,accepted"
+        "case,protocol_variant,ood_samples_per_round,k_exp,r,n,variable_count,max_layer_width,lambda_target,rho0,phase,reps,rayon_threads,commit_ms,open_ms,verify_ms,encode_oracle_ms,merkle_ms,to_multiquadratic_ms,open_fold_ms,open_fold_indices_ms,open_fold_eval_ms,open_fold_shift_points_ms,open_clone_ms,open_init_ms,open_sumcheck_ms,open_sumcheck_constraint_plan_ms,open_sumcheck_poly_restrict_ms,open_sumcheck_poly_eval_ms,open_sumcheck_accumulate_ms,open_sumcheck_interpolate_ms,open_restrict_ms,open_merkle_open_ms,open_constraint_ms,open_final_ms,verify_algebra_ms,verify_sumcheck_ms,verify_merkle_ms,verify_fold_ms,verify_constraint_ms,verify_final_ms,serialized_opening_bytes,accepted"
     );
     let fields = [
         case.name.to_string(),
+        protocol_variant(args).to_owned(),
+        args.ood_samples_per_round.to_string(),
         case.k_exp.to_string(),
         case.r.to_string(),
         case.n.to_string(),
@@ -493,9 +516,9 @@ fn write_csv(args: &Args, case: &WhirGrBenchCase, row: &ProfileRow) {
     println!("{}", fields.join(","));
 }
 
-fn write_summary_csv(case: &WhirGrBenchCase, row: &ProfileRow) {
+fn write_summary_csv(args: &Args, case: &WhirGrBenchCase, row: &ProfileRow) {
     println!(
-        "case,ring,k_exp,r,lambda_target,variable_count,max_layer_width,poly_dim,message_length,n_0,rho,commit_ms,open_ms,prove_ms,verify_ms,proof_size_bytes,proof_size_kb"
+        "case,protocol_variant,ood_samples_per_round,ring,k_exp,r,lambda_target,variable_count,max_layer_width,poly_dim,message_length,n_0,rho,commit_ms,open_ms,prove_ms,verify_ms,proof_size_bytes,proof_size_kb"
     );
     let message_length = pow_u64(3, case.variable_count);
     let proof_size_kb = row
@@ -504,6 +527,8 @@ fn write_summary_csv(case: &WhirGrBenchCase, row: &ProfileRow) {
         .unwrap_or_default();
     let fields = [
         case.name.to_string(),
+        protocol_variant(args).to_owned(),
+        args.ood_samples_per_round.to_string(),
         format!("\"GR(2^{},{})\"", case.k_exp, case.r),
         case.k_exp.to_string(),
         case.r.to_string(),
@@ -533,6 +558,8 @@ fn write_text(args: &Args, case: &WhirGrBenchCase, row: &ProfileRow) {
     println!("max_layer_width={}", case.max_layer_width);
     println!("lambda_target={}", case.lambda_target);
     println!("rho0={}/{}", case.rho0.numerator, case.rho0.denominator);
+    println!("protocol_variant={}", protocol_variant(args));
+    println!("ood_samples_per_round={}", args.ood_samples_per_round);
     println!("phase={:?}", args.phase);
     println!("reps={}", args.reps);
     println!("rayon_threads={}", row.rayon_threads);
@@ -598,6 +625,8 @@ fn write_json(args: &Args, case: &WhirGrBenchCase, row: &ProfileRow) {
                 "numerator": case.rho0.numerator,
                 "denominator": case.rho0.denominator,
             },
+            "protocol_variant": protocol_variant(args),
+            "ood_samples_per_round": args.ood_samples_per_round,
             "phase": format!("{:?}", args.phase),
             "reps": args.reps,
             "rayon_threads": row.rayon_threads,
@@ -633,6 +662,14 @@ fn write_json(args: &Args, case: &WhirGrBenchCase, row: &ProfileRow) {
             "accepted": row.accepted,
         })
     );
+}
+
+const fn protocol_variant(args: &Args) -> &'static str {
+    if args.ood_samples_per_round == 0 {
+        "whir_gr_ud"
+    } else {
+        "whir_gr_ud_ood"
+    }
 }
 
 fn print_optional_f64(label: &str, value: Option<f64>) {

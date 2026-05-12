@@ -151,7 +151,7 @@ pub fn select_whir_unique_decoding_parameters(
 
     let mut result = WhirUniqueDecodingSelection::default();
     result.notes.push(
-        "WHIR selector targets only the p=2 unique-decoding GR PCS mode; it does not model WHIR list-decoding or OOD uniqueness."
+        "WHIR selector targets only the p=2 unique-decoding GR PCS mode; optional OOD rounds are redundant consistency constraints and are not the finite-field WHIR list-decoding/OOD-uniqueness argument."
             .to_owned(),
     );
     result.notes.push(

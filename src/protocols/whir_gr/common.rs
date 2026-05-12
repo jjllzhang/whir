@@ -13,6 +13,7 @@ pub struct WhirGrPublicParameters {
     pub variable_count: u64,
     pub layer_widths: Vec<u64>,
     pub shift_repetitions: Vec<u64>,
+    pub ood_samples_per_round: Vec<u64>,
     pub final_repetitions: u64,
     pub degree_bounds: Vec<u64>,
     pub omega: GrElem,
@@ -35,6 +36,7 @@ impl WhirGrPublicParameters {
             variable_count,
             layer_widths: Vec::new(),
             shift_repetitions: Vec::new(),
+            ood_samples_per_round: Vec::new(),
             final_repetitions: 0,
             degree_bounds: Vec::new(),
             omega,
@@ -59,6 +61,7 @@ pub struct WhirGrSumcheckPolynomial {
 pub struct WhirGrRoundProof {
     pub sumcheck_polynomials: Vec<WhirGrSumcheckPolynomial>,
     pub g_root: Hash,
+    pub ood_answers: Vec<GrElem>,
     pub virtual_fold_openings: crate::protocols::whir_gr::merkle::CompactMerkleProof,
 }
 

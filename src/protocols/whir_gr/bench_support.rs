@@ -315,14 +315,30 @@ pub fn find_case_with_polynomial(
 
 #[doc(hidden)]
 pub fn commit_input(case: &WhirGrBenchCase) -> Result<CommitInput, Box<dyn Error>> {
-    let params = build_params(case)?;
+    commit_input_with_ood(case, 0)
+}
+
+#[doc(hidden)]
+pub fn commit_input_with_ood(
+    case: &WhirGrBenchCase,
+    ood_samples_per_round: u64,
+) -> Result<CommitInput, Box<dyn Error>> {
+    let params = build_params_with_ood(case, ood_samples_per_round)?;
     let polynomial = bench_polynomial(&params.ctx, case.variable_count, case.polynomial_kind, 0)?;
     Ok(CommitInput { params, polynomial })
 }
 
 #[doc(hidden)]
 pub fn open_input(case: &WhirGrBenchCase) -> Result<OpenInput, Box<dyn Error>> {
-    let input = commit_input(case)?;
+    open_input_with_ood(case, 0)
+}
+
+#[doc(hidden)]
+pub fn open_input_with_ood(
+    case: &WhirGrBenchCase,
+    ood_samples_per_round: u64,
+) -> Result<OpenInput, Box<dyn Error>> {
+    let input = commit_input_with_ood(case, ood_samples_per_round)?;
     let prover = WhirGrProver::new(&input.params);
     let (commitment, state) = commit_bench_polynomial(&prover, &input.polynomial)?;
     let point = open_point(&input.params.ctx, case.variable_count, 0);
@@ -364,7 +380,15 @@ pub fn commit_bench_polynomial_profiled(
 
 #[doc(hidden)]
 pub fn verify_input(case: &WhirGrBenchCase) -> Result<VerifyInput, Box<dyn Error>> {
-    let input = open_input(case)?;
+    verify_input_with_ood(case, 0)
+}
+
+#[doc(hidden)]
+pub fn verify_input_with_ood(
+    case: &WhirGrBenchCase,
+    ood_samples_per_round: u64,
+) -> Result<VerifyInput, Box<dyn Error>> {
+    let input = open_input_with_ood(case, ood_samples_per_round)?;
     let prover = WhirGrProver::new(&input.params);
     let opening = prover.open(&input.commitment, &input.state, &input.point)?;
     Ok(VerifyInput {
@@ -377,6 +401,14 @@ pub fn verify_input(case: &WhirGrBenchCase) -> Result<VerifyInput, Box<dyn Error
 
 #[doc(hidden)]
 pub fn build_params(case: &WhirGrBenchCase) -> Result<WhirGrPublicParameters, Box<dyn Error>> {
+    build_params_with_ood(case, 0)
+}
+
+#[doc(hidden)]
+pub fn build_params_with_ood(
+    case: &WhirGrBenchCase,
+    ood_samples_per_round: u64,
+) -> Result<WhirGrPublicParameters, Box<dyn Error>> {
     let selection = select_whir_unique_decoding_parameters(&WhirUniqueDecodingInputs {
         lambda_target: case.lambda_target,
         ring_exponent: u64::from(case.k_exp),
@@ -426,6 +458,9 @@ pub fn build_params(case: &WhirGrBenchCase) -> Result<WhirGrPublicParameters, Bo
     params.shift_repetitions = selection.public_params.shift_repetitions;
     params.final_repetitions = selection.public_params.final_repetitions;
     params.degree_bounds = selection.public_params.degree_bounds;
+    if ood_samples_per_round != 0 {
+        params.ood_samples_per_round = vec![ood_samples_per_round; params.layer_widths.len()];
+    }
     params.lambda_target = case.lambda_target;
     params.hash_id = BLAKE3;
     Ok(params)

@@ -16,8 +16,8 @@ use crate::{
         merkle::{ByteMerkleTree, CompactMerkleProof, MerkleOpeningHint},
         multiquadratic::{pow3_checked, pow_m},
         prover::{
-            indexed_label, opening_transcript, positions_to_sorted_usize,
-            validate_public_parameters,
+            add_batched_constraint_terms, derive_ood_points, indexed_label, ood_samples_for_round,
+            opening_transcript, positions_to_sorted_usize, validate_public_parameters,
         },
         serialization::{
             serialize_sumcheck_polynomial, WhirGrOpeningHintPayload, WhirGrOpeningProofPayload,
@@ -217,27 +217,41 @@ impl<'a> WhirGrVerifier<'a> {
         opening: &WhirGrOpening,
     ) -> Result<bool> {
         validate_public_parameters(self.public_params)?;
-        Ok(point.len() == self.public_params.variable_count as usize
-            && commitment.oracle_root != Hash::default()
-            && opening.proof.rounds.len() == self.public_params.layer_widths.len()
-            && opening.hints.rounds.len() == opening.proof.rounds.len()
-            && merkle_shape_valid(&opening.proof.final_openings)
-            && merkle_hint_shape_valid(
+        if point.len() != self.public_params.variable_count as usize
+            || commitment.oracle_root == Hash::default()
+            || opening.proof.rounds.len() != self.public_params.layer_widths.len()
+            || opening.hints.rounds.len() != opening.proof.rounds.len()
+            || !merkle_shape_valid(&opening.proof.final_openings)
+            || !merkle_hint_shape_valid(
                 &opening.proof.final_openings,
                 &opening.hints.final_leaf_payloads,
             )
-            && opening.proof.rounds.iter().all(round_shape_valid)
-            && opening
-                .proof
-                .rounds
-                .iter()
-                .zip(&opening.hints.rounds)
-                .all(|(round, hints)| {
-                    merkle_hint_shape_valid(
-                        &round.virtual_fold_openings,
-                        &hints.virtual_fold_leaf_payloads,
-                    )
-                }))
+            || !opening.proof.rounds.iter().all(round_shape_valid)
+        {
+            return Ok(false);
+        }
+
+        for (layer, (round, hints)) in opening
+            .proof
+            .rounds
+            .iter()
+            .zip(&opening.hints.rounds)
+            .enumerate()
+        {
+            let expected_ood_count =
+                usize::try_from(ood_samples_for_round(self.public_params, layer as u64)?)
+                    .map_err(|_| GrError::ArithmeticOverflow("WHIR_GR OOD count"))?;
+            if round.ood_answers.len() != expected_ood_count
+                || !merkle_hint_shape_valid(
+                    &round.virtual_fold_openings,
+                    &hints.virtual_fold_leaf_payloads,
+                )
+            {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
     }
 }
 
@@ -310,6 +324,10 @@ fn verify_round(
         &indexed_label(b"whir.g_root", input.layer, None),
         &input.round.g_root.0,
     );
+    let next_domain = input.current_domain.pow_map(3)?;
+    let Some(ood_points) = verify_ood_queries(params, transcript, input, &next_domain)? else {
+        return Ok(None);
+    };
     let fold_width = pow3_checked(input.width)?;
     let shift_domain_size = input.current_domain.size() / fold_width;
     let shift_positions = transcript.derive_unique_positions(
@@ -329,20 +347,9 @@ fn verify_round(
     {
         return Ok(None);
     }
-    let merkle_start = capture_timings.then(Instant::now);
-    let virtual_fold_hint = MerkleOpeningHint {
-        leaf_payloads: input.round_hints.virtual_fold_leaf_payloads.clone(),
-    };
-    if !ByteMerkleTree::verify_compact(
-        params.hash_id,
-        input.current_root,
-        &input.round.virtual_fold_openings,
-        &virtual_fold_hint,
-    )? {
-        record_elapsed(&mut timings.merkle_ms, merkle_start);
+    if !verify_virtual_fold_merkle(params, input, timings, capture_timings)? {
         return Ok(None);
     }
-    record_elapsed(&mut timings.merkle_ms, merkle_start);
 
     let gamma =
         transcript.challenge_teichmuller(ctx, &indexed_label(b"whir.gamma", input.layer, None))?;
@@ -360,24 +367,74 @@ fn verify_round(
     )?;
     record_elapsed(&mut timings.fold_ms, fold_start);
 
-    let mut gamma_power = gamma.clone();
-    for (shift_point, folded_value) in fold_queries
-        .shift_points
-        .into_iter()
-        .zip(&fold_queries.folded_values)
-    {
-        let constraint_start = capture_timings.then(Instant::now);
-        next_constraint.add_shift_term(gamma_power.clone(), shift_point)?;
-        *state.sigma = ctx.add(state.sigma, &ctx.mul(&gamma_power, folded_value));
-        gamma_power = ctx.mul(&gamma_power, &gamma);
-        record_elapsed(&mut timings.constraint_ms, constraint_start);
-    }
+    let constraint_start = capture_timings.then(Instant::now);
+    add_batched_constraint_terms(
+        ctx,
+        &mut next_constraint,
+        state.sigma,
+        &gamma,
+        [
+            (&ood_points[..], &input.round.ood_answers[..]),
+            (
+                &fold_queries.shift_points[..],
+                &fold_queries.folded_values[..],
+            ),
+        ],
+    )?;
+    record_elapsed(&mut timings.constraint_ms, constraint_start);
 
     *state.constraint = next_constraint;
     Ok(Some(NextVerifierState {
-        domain: input.current_domain.pow_map(3)?,
+        domain: next_domain,
         root: input.round.g_root,
     }))
+}
+
+fn verify_virtual_fold_merkle(
+    params: &WhirGrPublicParameters,
+    input: &VerifierRoundInput<'_>,
+    timings: &mut WhirGrVerifyTimings,
+    capture_timings: bool,
+) -> Result<bool> {
+    let merkle_start = capture_timings.then(Instant::now);
+    let virtual_fold_hint = MerkleOpeningHint {
+        leaf_payloads: input.round_hints.virtual_fold_leaf_payloads.clone(),
+    };
+    let accepted = ByteMerkleTree::verify_compact(
+        params.hash_id,
+        input.current_root,
+        &input.round.virtual_fold_openings,
+        &virtual_fold_hint,
+    )?;
+    record_elapsed(&mut timings.merkle_ms, merkle_start);
+    Ok(accepted)
+}
+
+fn verify_ood_queries(
+    params: &WhirGrPublicParameters,
+    transcript: &mut Transcript,
+    input: &VerifierRoundInput<'_>,
+    next_domain: &Domain,
+) -> Result<Option<Vec<Vec<GrElem>>>> {
+    let next_variable_count = input.live_variables - input.width;
+    let ood_points = derive_ood_points(
+        params,
+        transcript,
+        input.layer,
+        next_domain,
+        next_variable_count,
+    )?;
+    if input.round.ood_answers.len() != ood_points.len() {
+        return Ok(None);
+    }
+    for (sample_index, answer) in input.round.ood_answers.iter().enumerate() {
+        transcript.absorb_ring_element(
+            &params.ctx,
+            &indexed_label(b"whir.ood.answer", input.layer, Some(sample_index as u64)),
+            answer,
+        );
+    }
+    Ok(Some(ood_points))
 }
 
 fn parent_indices_by_shift(

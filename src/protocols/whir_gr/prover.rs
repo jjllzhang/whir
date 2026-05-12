@@ -394,17 +394,8 @@ fn prove_round(
     capture_timings: bool,
 ) -> Result<(WhirGrRoundProof, WhirGrRoundHints)> {
     let ctx = &params.ctx;
-    let merkle_open_start = capture_timings.then(Instant::now);
-    let (virtual_fold_openings, virtual_fold_hint) = state.tree.open_compact(&[0])?;
-    record_elapsed(&mut timings.merkle_open_ms, merkle_open_start);
-    let mut round = WhirGrRoundProof {
-        sumcheck_polynomials: Vec::with_capacity(width as usize),
-        g_root: Hash::default(),
-        virtual_fold_openings,
-    };
-    let mut round_hints = WhirGrRoundHints {
-        virtual_fold_leaf_payloads: virtual_fold_hint.leaf_payloads,
-    };
+    let (mut round, mut round_hints) =
+        initial_round_proof(state.tree, width, timings, capture_timings)?;
 
     let mut alphas = Vec::with_capacity(width as usize);
     let mut sumcheck_polynomial = state.polynomial.clone();
@@ -453,6 +444,10 @@ fn prove_round(
     round.g_root = next_tree.root();
     transcript.absorb_labeled_bytes(&indexed_label(b"whir.g_root", layer, None), &round.g_root.0);
 
+    let (ood_points, ood_answers) =
+        prove_ood_queries(params, transcript, layer, &next_domain, &next_polynomial)?;
+    round.ood_answers = ood_answers;
+
     let shift_domain_size = state.domain.size() / pow3_checked(width)?;
     let shift_positions = transcript.derive_unique_positions(
         &indexed_label(b"whir.shift", layer, None),
@@ -484,12 +479,16 @@ fn prove_round(
     let gamma =
         transcript.challenge_teichmuller(ctx, &indexed_label(b"whir.gamma", layer, None))?;
     let mut next_constraint = state.constraint.restrict_prefix(ctx, &alphas)?;
-    let mut gamma_power = gamma.clone();
-    for (point, value) in shift_data.shift_points.iter().zip(&shift_data.shift_values) {
-        next_constraint.add_shift_term(gamma_power.clone(), point.clone())?;
-        *state.sigma = ctx.add(state.sigma, &ctx.mul(&gamma_power, value));
-        gamma_power = ctx.mul(&gamma_power, &gamma);
-    }
+    add_batched_constraint_terms(
+        ctx,
+        &mut next_constraint,
+        state.sigma,
+        &gamma,
+        [
+            (&ood_points[..], &round.ood_answers[..]),
+            (&shift_data.shift_points[..], &shift_data.shift_values[..]),
+        ],
+    )?;
     record_elapsed(&mut timings.constraint_ms, constraint_start);
 
     *state.polynomial = next_polynomial;
@@ -498,6 +497,79 @@ fn prove_round(
     *state.tree = next_tree;
     *state.constraint = next_constraint;
     Ok((round, round_hints))
+}
+
+fn initial_round_proof(
+    tree: &ByteMerkleTree,
+    width: u64,
+    timings: &mut WhirGrOpenTimings,
+    capture_timings: bool,
+) -> Result<(WhirGrRoundProof, WhirGrRoundHints)> {
+    let merkle_open_start = capture_timings.then(Instant::now);
+    let (virtual_fold_openings, virtual_fold_hint) = tree.open_compact(&[0])?;
+    record_elapsed(&mut timings.merkle_open_ms, merkle_open_start);
+    Ok((
+        WhirGrRoundProof {
+            sumcheck_polynomials: Vec::with_capacity(width as usize),
+            g_root: Hash::default(),
+            ood_answers: Vec::new(),
+            virtual_fold_openings,
+        },
+        WhirGrRoundHints {
+            virtual_fold_leaf_payloads: virtual_fold_hint.leaf_payloads,
+        },
+    ))
+}
+
+fn prove_ood_queries(
+    params: &WhirGrPublicParameters,
+    transcript: &mut Transcript,
+    layer: u64,
+    domain: &Domain,
+    polynomial: &MultiQuadraticPolynomial,
+) -> Result<(Vec<Vec<GrElem>>, Vec<GrElem>)> {
+    let ctx = &params.ctx;
+    let points = derive_ood_points(
+        params,
+        transcript,
+        layer,
+        domain,
+        polynomial.variable_count(),
+    )?;
+    let mut answers = Vec::with_capacity(points.len());
+    for (sample_index, point) in points.iter().enumerate() {
+        let answer = polynomial.evaluate(ctx, point)?;
+        transcript.absorb_ring_element(
+            ctx,
+            &indexed_label(b"whir.ood.answer", layer, Some(sample_index as u64)),
+            &answer,
+        );
+        answers.push(answer);
+    }
+    Ok((points, answers))
+}
+
+pub(crate) fn add_batched_constraint_terms<const N: usize>(
+    ctx: &GrContext,
+    constraint: &mut WhirConstraint,
+    sigma: &mut GrElem,
+    gamma: &GrElem,
+    term_groups: [(&[Vec<GrElem>], &[GrElem]); N],
+) -> Result<()> {
+    let mut gamma_power = gamma.clone();
+    for (points, values) in term_groups {
+        if points.len() != values.len() {
+            return Err(GrError::InvalidDomain(
+                "WHIR_GR batched constraint term shape mismatch",
+            ));
+        }
+        for (point, value) in points.iter().zip(values) {
+            constraint.add_shift_term(gamma_power.clone(), point.clone())?;
+            *sigma = ctx.add(sigma, &ctx.mul(&gamma_power, value));
+            gamma_power = ctx.mul(&gamma_power, gamma);
+        }
+    }
+    Ok(())
 }
 
 fn shift_query_data(
@@ -933,6 +1005,44 @@ pub(crate) fn indexed_label(prefix: &[u8], round: u64, index: Option<u64>) -> Ve
     label
 }
 
+pub(crate) fn ood_samples_for_round(params: &WhirGrPublicParameters, layer: u64) -> Result<u64> {
+    if params.ood_samples_per_round.is_empty() {
+        return Ok(0);
+    }
+    let layer_index =
+        usize::try_from(layer).map_err(|_| GrError::ArithmeticOverflow("WHIR_GR layer index"))?;
+    params
+        .ood_samples_per_round
+        .get(layer_index)
+        .copied()
+        .ok_or(GrError::InvalidDomain(
+            "WHIR_GR OOD metadata length mismatch",
+        ))
+}
+
+pub(crate) fn derive_ood_points(
+    params: &WhirGrPublicParameters,
+    transcript: &mut Transcript,
+    layer: u64,
+    domain: &Domain,
+    variable_count: u64,
+) -> Result<Vec<Vec<GrElem>>> {
+    let ctx = &params.ctx;
+    let count = ood_samples_for_round(params, layer)?;
+    let count =
+        usize::try_from(count).map_err(|_| GrError::ArithmeticOverflow("WHIR_GR OOD count"))?;
+    let mut points = Vec::with_capacity(count);
+    for sample_index in 0..count {
+        let eta = transcript.challenge_teichmuller_outside_domain(
+            ctx,
+            &indexed_label(b"whir.ood.sample", layer, Some(sample_index as u64)),
+            domain,
+        )?;
+        points.push(pow_m(ctx, &eta, variable_count)?);
+    }
+    Ok(points)
+}
+
 pub(crate) fn positions_to_sorted_usize(mut indices: Vec<u64>, size: u64) -> Result<Vec<usize>> {
     indices.sort_unstable();
     indices.dedup();
@@ -963,6 +1073,8 @@ pub(crate) fn validate_public_parameters(params: &WhirGrPublicParameters) -> Res
     }
     if params.shift_repetitions.len() != params.layer_widths.len()
         || params.degree_bounds.len() != params.layer_widths.len()
+        || (!params.ood_samples_per_round.is_empty()
+            && params.ood_samples_per_round.len() != params.layer_widths.len())
     {
         return Err(GrError::InvalidDomain(
             "WHIR_GR layer metadata length mismatch",
@@ -1116,6 +1228,18 @@ mod tests {
         params
     }
 
+    fn public_parameters_with_ood(
+        variable_count: u64,
+        max_layer_width: u64,
+        ood_samples_per_round: u64,
+    ) -> WhirGrPublicParameters {
+        let mut params = public_parameters(variable_count, max_layer_width);
+        if ood_samples_per_round != 0 {
+            params.ood_samples_per_round = vec![ood_samples_per_round; params.layer_widths.len()];
+        }
+        params
+    }
+
     fn polynomial(ctx: &GrContext, variable_count: u64) -> MultiQuadraticPolynomial {
         let coefficient_count = 3u64.pow(variable_count as u32);
         let coefficients = (0..coefficient_count)
@@ -1157,6 +1281,7 @@ mod tests {
         assert_eq!(opening.proof.rounds.len(), params.layer_widths.len());
         for (round, &width) in opening.proof.rounds.iter().zip(&params.layer_widths) {
             assert_eq!(round.sumcheck_polynomials.len(), width as usize);
+            assert_eq!(round.ood_answers.len(), 0);
         }
     }
 
@@ -1166,6 +1291,26 @@ mod tests {
         run_roundtrip(2, 1);
         run_roundtrip(3, 1);
         run_roundtrip(2, 2);
+    }
+
+    #[test]
+    fn ood_roundtrips_should_verify() {
+        let params = public_parameters_with_ood(3, 1, 1);
+        let poly = polynomial(&params.ctx, 3);
+        let point = open_point(&params.ctx, 3);
+        let prover = WhirGrProver::new(&params);
+        let verifier = WhirGrVerifier::new(&params);
+
+        let (commitment, state) = prover.commit(&poly).unwrap();
+        let opening = prover.open(&commitment, &state, &point).unwrap();
+
+        assert!(verifier.verify(&commitment, &point, &opening).unwrap());
+        assert_eq!(opening.proof.rounds.len(), params.layer_widths.len());
+        assert!(opening
+            .proof
+            .rounds
+            .iter()
+            .all(|round| round.ood_answers.len() == 1));
     }
 
     #[test]
@@ -1338,6 +1483,28 @@ mod tests {
             .ctx
             .add(&bad_final.proof.final_constant, &params.ctx.one());
         assert!(!verifier.verify(&commitment, &point, &bad_final).unwrap());
+    }
+
+    #[test]
+    fn verifier_should_reject_ood_tampering() {
+        let params = public_parameters_with_ood(2, 1, 1);
+        let poly = polynomial(&params.ctx, 2);
+        let point = open_point(&params.ctx, 2);
+        let prover = WhirGrProver::new(&params);
+        let verifier = WhirGrVerifier::new(&params);
+        let (commitment, state) = prover.commit(&poly).unwrap();
+        let opening = prover.open(&commitment, &state, &point).unwrap();
+
+        let mut bad_answer = opening.clone();
+        bad_answer.proof.rounds[0].ood_answers[0] = params.ctx.add(
+            &bad_answer.proof.rounds[0].ood_answers[0],
+            &params.ctx.one(),
+        );
+        assert!(!verifier.verify(&commitment, &point, &bad_answer).unwrap());
+
+        let mut bad_length = opening;
+        bad_length.proof.rounds[0].ood_answers.clear();
+        assert!(!verifier.verify(&commitment, &point, &bad_length).unwrap());
     }
 
     #[test]

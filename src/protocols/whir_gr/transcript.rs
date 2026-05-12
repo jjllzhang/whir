@@ -1,7 +1,7 @@
 use serde::Serialize;
 
 use crate::{
-    algebra::galois_ring::{is_teichmuller_element, GrContext, GrElem, GrError, Result},
+    algebra::galois_ring::{is_teichmuller_element, Domain, GrContext, GrElem, GrError, Result},
     transcript::{
         codecs::Empty, DomainSeparator, Encoding, NargDeserialize, ProverState, VerificationError,
         VerificationResult, VerifierMessage,
@@ -165,6 +165,31 @@ impl Transcript {
             "failed to sample Teichmuller transcript challenge",
         ))
     }
+
+    pub fn challenge_teichmuller_outside_domain(
+        &mut self,
+        ctx: &GrContext,
+        label: &[u8],
+        domain: &Domain,
+    ) -> Result<GrElem> {
+        if domain.context().config() != ctx.config() {
+            return Err(GrError::DifferentRings);
+        }
+
+        for attempt in 0..4096u64 {
+            let mut attempt_label = Vec::with_capacity(label.len() + 8);
+            attempt_label.extend_from_slice(label);
+            attempt_label.extend_from_slice(&attempt.to_le_bytes());
+            let candidate = self.challenge_teichmuller(ctx, &attempt_label)?;
+            if !domain.contains(&candidate) {
+                return Ok(candidate);
+            }
+        }
+
+        Err(GrError::InvalidDomain(
+            "failed to sample out-of-domain Teichmuller transcript challenge",
+        ))
+    }
 }
 
 fn read_len_prefixed(buf: &mut &[u8]) -> VerificationResult<Vec<u8>> {
@@ -190,8 +215,10 @@ fn read_u64(buf: &mut &[u8]) -> VerificationResult<u64> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use crate::{
-        algebra::galois_ring::{is_teichmuller_element, GrConfig, GrContext},
+        algebra::galois_ring::{is_teichmuller_element, Domain, GrConfig, GrContext},
         protocols::whir_gr::transcript::{Transcript, TranscriptFrame},
         transcript::{NargDeserialize, NargSerialize},
     };
@@ -243,6 +270,20 @@ mod tests {
         let challenge = transcript.challenge_teichmuller(&ctx, b"gamma").unwrap();
 
         assert!(is_teichmuller_element(&ctx, &challenge));
+    }
+
+    #[test]
+    fn ood_teichmuller_challenge_should_avoid_domain() {
+        let ctx = Arc::new(sample_context());
+        let domain = Domain::teichmuller_subgroup(Arc::clone(&ctx), 9).unwrap();
+        let mut transcript = Transcript::new(b"ood");
+
+        let challenge = transcript
+            .challenge_teichmuller_outside_domain(&ctx, b"eta", &domain)
+            .unwrap();
+
+        assert!(is_teichmuller_element(&ctx, &challenge));
+        assert!(!domain.contains(&challenge));
     }
 
     #[test]
