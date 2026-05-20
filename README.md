@@ -1,19 +1,59 @@
-<h1 align="center">WHIR 🌪️</h1>
+# Anonymous WHIR Review Artifact
 
-This library was developed using the [arkworks](https://arkworks.rs) ecosystem to accompany [WHIR 🌪️](https://eprint.iacr.org/2024/1586). 
-By [Gal Arnon](https://galarnon42.github.io/) [Alessandro Chiesa](https://ic-people.epfl.ch/~achiesa/), [Giacomo Fenzi](https://gfenzi.io), and [Eylon Yogev](https://www.eylonyogev.com/about).
+This repository is an anonymous review artifact containing a modified WHIR
+implementation, benchmark code, result files, and supporting scripts used for
+the reported measurements. It is intended for artifact review and measurement
+reproduction only; the paper remains self-contained and does not rely on this
+repository.
 
-**WARNING:** This is an academic prototype and has not received careful code review. This implementation is NOT ready for production use.
+This artifact is derived from the public WHIR implementation. The upstream
+copyright and license notices are retained unchanged in `LICENSE-APACHE` and
+`LICENSE-MIT`; see `THIRD_PARTY_LICENSES.md` for details.
 
-<p align="center">
-    <a href="https://github.com/WizardOfMenlo/whir/blob/main/LICENSE-APACHE"><img src="https://img.shields.io/badge/license-APACHE-blue.svg"></a>
-    <a href="https://github.com/WizardOfMenlo/whir/blob/main/LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
-</p>
+**WARNING:** This is an academic prototype and has not received careful code
+review. This implementation is not ready for production use.
 
-# Usage
+## Contents
+
+- `src/`: protocol and algebra implementation.
+- `benches/`: benchmark entry points.
+- `results/`: result files used for reported measurements.
+- `examples/`: small executable examples.
+- `docs/`: supplementary implementation notes.
+
+## Build
+
+```bash
+cargo build --release
 ```
-cargo run --release -- --help
 
+Run tests:
+
+```bash
+cargo test
+```
+
+Run the finite-field WHIR command-line benchmark/help entry point:
+
+```bash
+cargo run --release -- --help
+```
+
+Run the Galois-ring WHIR benchmark:
+
+```bash
+cargo bench --bench whir_gr --features "parallel asm" -- --ignored
+```
+
+For a fixed Rayon thread count, set `RAYON_NUM_THREADS` explicitly:
+
+```bash
+RAYON_NUM_THREADS=8 cargo bench --bench whir_gr --features "parallel asm" -- --ignored
+```
+
+## Finite-Field WHIR CLI
+
+```text
 Usage: main [OPTIONS]
 
 Options:
@@ -34,14 +74,15 @@ Options:
 ```
 
 Options:
-- `-t` can be either `PCS` or `LDT` to run as a (multilinear) PCS or a LDT
-- `-l` sets the (overall) security level of the scheme
-- `-p` sets the number of PoW bits (used for the query-phase). PoW bits for proximity gaps are set automatically.
-- `-d` sets the number of variables of the scheme.
-- `-e` sets the number of evaluations to prove. Only meaningful in PCS mode.
-- `-r` sets the log_inv of the rate
-- `-k` sets the number of variables to fold at each iteration. 
-- `--sec` sets the settings used to compute security. Available `UniqueDecoding`, `ProvableList`, `ConjectureList`
-- `--fold_type` sets the settings used to compute folds. Available `Naive`, `ProverHelps`
-- `-f` sets the field used, available are `Goldilocks2, Goldilocks3, Field192, Field256`.
-- `--hash` sets the hash used for the Merkle tree, available are `SHA3` and `Blake3`
+
+- `-t` can be either `PCS` or `LDT`.
+- `-l` sets the overall security level.
+- `-p` sets the number of query-phase proof-of-work bits.
+- `-d` sets the number of variables.
+- `-e` sets the number of evaluations to prove in PCS mode.
+- `-r` sets the inverse-rate logarithm.
+- `-k` sets the number of variables folded at each iteration.
+- `--sec` selects `UniqueDecoding`, `ProvableList`, or `ConjectureList`.
+- `--fold_type` selects `Naive` or `ProverHelps`.
+- `-f` selects `Goldilocks2`, `Goldilocks3`, `Field192`, or `Field256`.
+- `--hash` selects `SHA3` or `Blake3`.
